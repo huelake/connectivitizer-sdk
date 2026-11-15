@@ -1,0 +1,49 @@
+{
+  "name": "@huelake/connectivitizer-react-native",
+  "version": "1.0.33",
+  "description": "Connectivitizer for React Native apps: reach services on devices behind NAT, end-to-end encrypted, peer to peer or relayed. Brings the native UDP and network access peer-to-peer sessions need.",
+  "license": "MIT",
+  "author": "Huelake Software Solutions UG (haftungsbeschränkt) <info@huelake.com>",
+  "homepage": "https://connectivitizer.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huelake/connectivitizer-sdk.git",
+    "directory": "connectivitizer-react-native"
+  },
+  "keywords": [
+    "connectivitizer",
+    "react-native",
+    "expo",
+    "remote-access",
+    "nat-traversal",
+    "peer-to-peer",
+    "iot"
+  ],
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "files": [
+    "build",
+    "android/build.gradle",
+    "android/src",
+    "expo-module.config.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@huelake/connectivitizer": "*",
+    "expo": ">=52",
+    "expo-crypto": "*"
+  },
+  "devDependencies": {
+    "@huelake/connectivitizer": "file:../connectivitizer-js",
+    "typescript": "~5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

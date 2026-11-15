@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<Import Project="..\Package.props" />
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>disable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<IsAotCompatible>true</IsAotCompatible>
+		<IsPackable>true</IsPackable>
+		<PackageId>Huelake.Connectivitizer.Kcp</PackageId>
+		<Description>Reliable stream over UDP (KCP) used by Connectivitizer direct connections. Vendored from KcpSharp (MIT).</Description>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<NoWarn>$(NoWarn);CS1591</NoWarn>
+		<!-- Vendored third-party source (KcpSharp, MIT): keep its warnings out of our build output. -->
+		<NoWarn>$(NoWarn);CS1591;CA1031;CA1508;CA1815;CA2002;CA2213;CA2231</NoWarn>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- KcpSharp's own MIT notice travels with the package. -->
+		<None Include="KcpSharp\LICENSE" Pack="true" PackagePath="licenses\KcpSharp" />
+	</ItemGroup>
+
+</Project>

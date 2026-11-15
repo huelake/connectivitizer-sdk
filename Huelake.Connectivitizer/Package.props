@@ -1,0 +1,22 @@
+<Project>
+	<!-- What the SDK packages (Client, Protocol, Kcp) say about themselves on nuget.org. The release pipeline sets the
+	     version (build/sdk/pack.sh: -p:Version=...); local builds stay 1.0.0-dev. -->
+	<PropertyGroup>
+		<Version Condition="'$(Version)' == ''">1.0.0-dev</Version>
+		<Authors>Huelake</Authors>
+		<Company>Huelake Software Solutions UG (haftungsbeschränkt)</Company>
+		<Copyright>Copyright (c) 2026 Huelake Software Solutions UG (haftungsbeschränkt)</Copyright>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageProjectUrl>https://connectivitizer.com</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/huelake/connectivitizer-sdk</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageTags>connectivitizer;remote-access;nat-traversal;peer-to-peer;end-to-end-encryption;iot</PackageTags>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+		<!-- The packages are built from this (private) repository and mirrored to GitHub: no Source Link or commit id
+		     pointing here. The sources are embedded in the symbols instead, so stepping into the SDK works. -->
+		<EnableSourceLink>false</EnableSourceLink>
+		<EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
+		<EmbedAllSources>true</EmbedAllSources>
+	</PropertyGroup>
+</Project>

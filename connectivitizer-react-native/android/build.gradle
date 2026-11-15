@@ -1,0 +1,15 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'com.huelake.connectivitizer.reactnative'
+version = '1.0.0-dev'
+
+android {
+  namespace "com.huelake.connectivitizer.reactnative"
+  defaultConfig {
+    versionCode 1
+    versionName '1.0.0-dev'
+  }
+}

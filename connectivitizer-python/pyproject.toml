@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "huelake-connectivitizer"
+version = "1.0.33"
+description = "Connectivitizer SDK for Python: reach services on devices behind NAT, end-to-end encrypted, relayed or peer to peer; and run a device."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Huelake Software Solutions UG (haftungsbeschränkt)", email = "info@huelake.com" }]
+keywords = ["connectivitizer", "remote-access", "nat-traversal", "peer-to-peer", "end-to-end-encryption", "iot"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Internet",
+    "Topic :: System :: Networking",
+]
+requires-python = ">=3.10"
+# Everything else (WebSocket, HTTP, UDP, KCP, the Noise handshake) is in this package and the standard library.
+dependencies = ["cryptography>=42"]
+
+[project.urls]
+Homepage = "https://connectivitizer.com"
+Documentation = "https://connectivitizer.com/docs"
+Source = "https://github.com/huelake/connectivitizer-sdk"
+
+[project.scripts]
+connectivitizer = "connectivitizer.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

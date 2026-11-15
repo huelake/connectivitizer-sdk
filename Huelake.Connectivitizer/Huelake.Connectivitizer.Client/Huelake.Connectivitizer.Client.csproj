@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<Import Project="..\Package.props" />
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<IsAotCompatible>true</IsAotCompatible>
+		<IsPackable>true</IsPackable>
+		<PackageId>Huelake.Connectivitizer.Client</PackageId>
+		<Description>Connectivitizer client library: connect to services on registered devices, or host a device agent in your own application. Direct when possible, end-to-end encrypted always.</Description>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<InternalsVisibleTo Include="Huelake.Connectivitizer.Client.Tests" />
+		<InternalsVisibleTo Include="Huelake.Connectivitizer.Gateway" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\Huelake.Connectivitizer.Kcp\Huelake.Connectivitizer.Kcp.csproj" />
+		<ProjectReference Include="..\Huelake.Connectivitizer.Protocol\Huelake.Connectivitizer.Protocol.csproj" />
+	</ItemGroup>
+
+</Project>
