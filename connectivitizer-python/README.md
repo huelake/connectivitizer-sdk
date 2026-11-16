@@ -40,7 +40,7 @@ The guide with complete examples: [https://connectivitizer.com/guides/python.md]
 | `session.info` | `mode`, `transport`, `end_to_end_encrypted`, `trust`, `peer_address`, `direct_failure_reason`. |
 | `await session.close()`, `await client.close()` | End the session, or everything. |
 
-Errors are `ConnectivitizerError` with a stable `code` (`E2E_SHARED_KEY_MISMATCH`, `DEVICE_OFFLINE`, `FORBIDDEN`, …; protocol section 9).
+Errors are `ConnectivitizerError` with a stable `code` (`E2E_SHARED_KEY_MISMATCH`, `DEVICE_OFFLINE`, `FORBIDDEN`, …; see [Error codes](https://connectivitizer.com/guides/errors.md)).
 
 `await link_app(api_url, "Report service", on_prompt)` links a program to an account instead of giving it a key: the person approves in the web app and the program receives an API key of its own (`LINK_DENIED`, `LINK_EXPIRED` when not).
 
@@ -69,21 +69,19 @@ Nothing to configure. `Platform` binds a dual-stack UDP socket on a port the sys
 | `direct/` | Addresses, STUN and hole punching, KCP (a port of the reference `ikcp.c`), the KCP path. |
 | `http.py`, `websocket.py` | HTTP/1.1 and WebSocket over any byte stream: to the platform and to the device's services. |
 | `platform.py` | asyncio sockets, UDP and local addresses. |
-| `interop/` | The programs the .NET test suite runs against the other implementations. |
-
-The structure follows the TypeScript SDK (`src/connectivitizer-js/src/core`), which is the reference for this port.
+| `interop/` | Programs for the interoperability tests with the other implementations. |
 
 ## Checks
 
 ```
 python -m venv .venv && .venv/Scripts/pip install -e .        # .venv/bin on Linux and macOS
-.venv/Scripts/python -m unittest discover -s tests -t .       # the shared vectors in docs/protocol/vectors, and every layer in memory
-dotnet test ../Huelake.Connectivitizer.sln --filter "FullyQualifiedName~PythonInteropTests"
+.venv/Scripts/python -m unittest discover -s tests -t .       # every layer in memory
 ```
 
-The last line runs this SDK against the real control plane and relay, with the .NET library and the TypeScript SDK on the other side, in both directions, relayed and peer to peer.
+Each release is also tested against the control plane and the relay with the .NET library and the TypeScript SDK on the other side, in both directions, relayed and peer to peer.
 
-## Not included yet
+## Limits
 
-- Certificates and pairing (the shared key is the only end-to-end layer for now), and enrollment with a one-time token.
-- Direct connections over TCP, and compatibility mode.
+- The shared key is the only end-to-end layer. Certificates with pairing, and enrollment with a one-time token, are in `cz`, the .NET library and the TypeScript SDK on Node.js.
+- Direct sessions use UDP. Direct connections over TCP are in `cz` and the .NET library only.
+- A device run by this SDK cannot be reached in compatibility mode (through the gateway).

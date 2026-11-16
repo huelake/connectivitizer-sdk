@@ -4,7 +4,7 @@ package com.huelake.connectivitizer.internal
  * The X25519 key agreement function of RFC 7748, because Android's JCA has none before API 33. The
  * arithmetic follows the public-domain TweetNaCl reference, as the .NET library's X25519.cs does (field
  * elements as 16 limbs of 16 bits, a Montgomery ladder whose operations do not depend on the scalar). It is
- * checked against the RFC's vectors in docs/protocol/vectors/x25519.json.
+ * checked against the RFC's test vectors.
  */
 internal object X25519 {
     const val KEY_SIZE = 32

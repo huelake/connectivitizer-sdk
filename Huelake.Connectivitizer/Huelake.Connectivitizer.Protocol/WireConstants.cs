@@ -1,7 +1,7 @@
 namespace Huelake.Connectivitizer.Protocol;
 
 /// <summary>
-/// Values fixed by the wire protocol (see docs/protocol). Every implementation in every
+/// Values fixed by the wire protocol. Every implementation in every
 /// language must use exactly these; changing one is a protocol version change.
 /// </summary>
 public static class WireConstants

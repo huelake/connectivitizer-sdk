@@ -17,6 +17,8 @@
 		     pointing here. The sources are embedded in the symbols instead, so stepping into the SDK works. -->
 		<EnableSourceLink>false</EnableSourceLink>
 		<EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
-		<EmbedAllSources>true</EmbedAllSources>
+		<!-- Only where symbols are written: cz is published with DebugType=none (build-downloads.mjs), and the compiler
+		     refuses to embed sources into no symbols at all (CS2045). -->
+		<EmbedAllSources Condition="'$(DebugType)' != 'none'">true</EmbedAllSources>
 	</PropertyGroup>
 </Project>

@@ -38,7 +38,7 @@ ESM only, Node.js 20 or newer. Its only dependencies are `@noble/curves`, `@nobl
 |---|---|
 | `createClient(options)` | `apiUrl`; `auth`; `sharedKey`; `disableDirect: true` to always use the relay |
 | `auth: { apiKey }` | An application key of the workspace (`czk_…`): created in the web app, or handed to the app by `linkApp` (below). |
-| `auth: { signIn: { workspaceId, client, getAccessToken } }` | For an app that runs the identity provider's sign-in itself and has the user's access token. That needs a client registered at the identity provider for the app, so it is for first-party apps; everybody else uses `linkApp`. |
+| `auth: { signIn: { workspaceId, client, getAccessToken } }` | For an app that runs the identity provider's sign-in itself and has the user's access token. That needs a client registered at the identity provider for the app; apps without one use `linkApp`. |
 | `auth: { getToken }` | Anything else that can produce a token of the control plane. |
 | `client.listDevices()` | The devices this application may reach: name, alias, whether they are online, and the services it may use. |
 | `client.connect(device, services)` | Opens a session to a device by its name. |
@@ -48,7 +48,7 @@ ESM only, Node.js 20 or newer. Its only dependencies are `@noble/curves`, `@nobl
 | `session.openStream(service)` | The raw byte stream, for any other protocol. |
 | `session.end()`, `client.close()` | End the session, or everything. |
 
-Errors are `ConnectivitizerError` with a stable `code` (`E2E_SHARED_KEY_MISMATCH`, `DEVICE_OFFLINE`, `FORBIDDEN`, …; protocol section 9).
+Errors are `ConnectivitizerError` with a stable `code` (`E2E_SHARED_KEY_MISMATCH`, `DEVICE_OFFLINE`, `FORBIDDEN`, …; see [Error codes](https://connectivitizer.com/guides/errors.md)).
 
 ## Linking an app instead of giving it a key
 
@@ -150,20 +150,19 @@ This is Node.js only: React Native has no TLS for a stream the app owns.
 | `src/core` | Everything that does not depend on a runtime: signaling, grants, the shared-key channel (Noise `NNpsk0`), multiplexing, relay path, STUN and hole punching, KCP, HTTP and WebSocket over a session stream. |
 | `src/node` | The Node.js adapter (`node:net`, `node:tls`, `node:dgram`), the certificate layer, the state directory and pairing. |
 | `src/react-native.ts` | The React Native adapter (built-in `WebSocket` and `fetch`; UDP and random bytes passed in). Apps use `@huelake/connectivitizer-react-native`, which passes them. |
-| `interop/` | The programs the .NET test suite runs against the .NET library and the ESP32 library's code. |
+| `interop/` | Programs for the interoperability tests with the other implementations. |
 
 ## Checks
 
 ```
 npm run build
-npm test                # the Noise test vector, KCP, multiplexing, HTTP and WebSocket framing, certificates, pairing,
-                        # and the shared vectors in docs/protocol/vectors (WRITE_VECTORS=1 rewrites them)
-dotnet test ../Huelake.Connectivitizer.sln --filter "FullyQualifiedName~TypeScript|FullyQualifiedName~NodeExamplesTests"
+npm test                # the Noise test vector, KCP, multiplexing, HTTP and WebSocket framing, certificates, pairing
 ```
 
-The last line runs this SDK against the real control plane and relay, with the .NET library on the other side, in both directions, relayed and peer to peer, with a shared key and with certificates (including pairing between the two implementations and a state directory written by one and used by the other).
+Each release is also tested against the control plane and the relay with the .NET library on the other side, in both directions, relayed and peer to peer, with a shared key and with certificates.
 
-## Not included
+## Limits
 
-- Certificates in React Native. A session between a React Native app and an endpoint that has only certificates needs that endpoint to hold the shared key as well (`cz key add`).
-- Direct connections over TCP, and compatibility mode (the gateway) for a device run by this SDK.
+- Certificates and pairing work on Node.js only. A React Native app reaches an endpoint that has only certificates once that endpoint holds the shared key as well (`cz key add`).
+- Direct sessions use UDP. Direct connections over TCP are in `cz` and the .NET library only.
+- A device run by this SDK cannot be reached in compatibility mode (through the gateway).

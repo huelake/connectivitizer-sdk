@@ -60,9 +60,14 @@ object ErrorCodes {
     const val TARGET_UNREACHABLE = "TARGET_UNREACHABLE"
 }
 
-/** Every failure of the SDK. [code] is one of [ErrorCodes], or a code the platform added since. */
+/**
+ * Every failure of the SDK. [code] is one of [ErrorCodes], or a code the platform added since.
+ *
+ * Unchecked, as Kotlin has no checked exceptions: the blocking methods Java calls (`connectBlocking`,
+ * `fetchBlocking`, ...) declare nothing, so a checked exception could not be caught by its type there.
+ */
 class ConnectivitizerException(val code: String, message: String? = null, cause: Throwable? = null) :
-    Exception(message ?: code, cause)
+    RuntimeException(message ?: code, cause)
 
 /** The code of an error, or [fallback] for anything that is not a [ConnectivitizerException]. */
 internal fun codeOf(error: Throwable, fallback: String = ErrorCodes.SESSION_CLOSED): String =

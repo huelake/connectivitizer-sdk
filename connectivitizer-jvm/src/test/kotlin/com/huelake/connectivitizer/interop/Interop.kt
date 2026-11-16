@@ -1,5 +1,5 @@
-// The programs the .NET test suite runs as separate processes, with the same environment and output as the
-// Node.js (src/connectivitizer-js/interop) and Python ones:
+// The programs the interoperability tests run as separate processes, with the same environment and output as
+// the Node.js (connectivitizer-js/interop) and Python ones:
 //
 //   InteropKt client   a calling application: connects, uses the service every way the SDK offers, prints one JSON report
 //   InteropKt device   a device: logs in with a device key, exposes CZ_TARGET as CZ_SERVICE, prints READY, then its log

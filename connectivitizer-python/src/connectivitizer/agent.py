@@ -163,8 +163,10 @@ class ConnectivitizerAgent:
                 self._log(f"platform unavailable ({error}); retrying in {round(backoff)} s")
             if self._stopped:
                 break
-            # Jitter keeps a fleet of devices from reconnecting in the same instant after an outage.
-            await settled_within(self._stop_signal, backoff + random.random() * 0.5)
+            # Waits a random time between half and the whole back-off. A fleet refused together (an outage, a restart, the platform
+            # shedding load) must not come back together: with only a little jitter it came back in waves 30 s apart that the
+            # platform could not take, with nothing to do in between.
+            await settled_within(self._stop_signal, backoff / 2 + random.random() * backoff / 2)
             backoff = min(backoff * 2, 30.0)
 
     async def stop(self) -> None:

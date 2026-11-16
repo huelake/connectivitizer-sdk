@@ -1,7 +1,7 @@
 """KCP: a reliable, ordered stream over datagrams.
 
 A port to Python of the reference implementation ikcp.c by Lin Wei (skywind3000/kcp, MIT licence, revision
-b1a7a21), wire-compatible with it, following the TypeScript port of this repository line by line. The
+b1a7a21), wire-compatible with it, following the TypeScript SDK's port line by line. The
 pluggable congestion control of the original is left out, because the protocol runs KCP with congestion
 control switched off.
 

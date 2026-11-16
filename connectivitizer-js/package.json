@@ -1,6 +1,6 @@
 {
   "name": "@huelake/connectivitizer",
-  "version": "1.0.33",
+  "version": "1.0.50",
   "description": "Connectivitizer SDK for Node.js and React Native: reach services on devices behind NAT, end-to-end encrypted, relayed or peer to peer.",
   "license": "MIT",
   "author": "Huelake Software Solutions UG (haftungsbeschränkt) <info@huelake.com>",

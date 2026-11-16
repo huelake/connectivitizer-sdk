@@ -196,8 +196,10 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
                     log("platform unavailable (${e.code}); retrying in ${backoff / 1000} s")
                 }
                 if (stopped) break
-                // Jitter keeps a fleet of devices from reconnecting in the same instant after an outage.
-                withTimeoutOrNull(backoff + Random.nextLong(500)) { stopSignal.await() }
+                // Waits a random time between half and the whole back-off. A fleet refused together (an outage, a restart, the platform
+                // shedding load) must not come back together: with only a little jitter it came back in waves 30 s apart that the
+                // platform could not take, with nothing to do in between.
+                withTimeoutOrNull(backoff / 2 + Random.nextLong(backoff / 2 + 1)) { stopSignal.await() }
                 backoff = minOf(backoff * 2, 30_000)
             }
         } finally {

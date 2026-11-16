@@ -202,8 +202,10 @@ export class ConnectivitizerAgent {
       if (this.stopped) {
         break;
       }
-      // Jitter keeps a fleet of devices from reconnecting in the same instant after an outage.
-      await settledWithin(this.stopSignal.promise, backoff + Math.floor(Math.random() * 500));
+      // Waits a random time between half and the whole back-off. A fleet refused together (an outage, a restart, the platform
+      // shedding load) must not come back together: with only a little jitter it came back in waves 30 s apart that the
+      // platform could not take, with nothing to do in between.
+      await settledWithin(this.stopSignal.promise, backoff / 2 + Math.floor((Math.random() * backoff) / 2));
       backoff = Math.min(backoff * 2, 30_000);
     }
   }

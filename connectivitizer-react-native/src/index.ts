@@ -1,6 +1,6 @@
 // Connectivitizer for React Native apps. The protocol is the TypeScript SDK's (@huelake/connectivitizer);
 // this package adds what a phone runtime does not have built in: UDP sockets and the phone's own
-// addresses (the native module ConnectivitizerNative, Android for now), and a secure random source
+// addresses (the native module ConnectivitizerNative, on Android), and a secure random source
 // (expo-crypto). The app passes nothing of that: only its address, its key and the shared key.
 
 import { requireOptionalNativeModule } from 'expo';
@@ -36,7 +36,7 @@ const native = requireOptionalNativeModule<NativeModule>('ConnectivitizerNative'
 
 /**
  * Whether this build can connect peer to peer. False in Expo Go (which cannot contain the native
- * module) and on iOS for now: sessions then go through the relay, still end-to-end encrypted.
+ * module) and on iOS: sessions then go through the relay, still end-to-end encrypted.
  */
 export const peerToPeerAvailable = (): boolean => native !== null;
 
@@ -95,7 +95,7 @@ export function platform(): Platform {
   if (native === null) {
     if (!warned) {
       warned = true;
-      console.warn('Connectivitizer: this build has no native module (Expo Go, or iOS for now). Every session goes through the relay, still end-to-end encrypted.');
+      console.warn('Connectivitizer: this build has no native module (Expo Go, or iOS). Every session goes through the relay, still end-to-end encrypted.');
     }
     return base;
   }

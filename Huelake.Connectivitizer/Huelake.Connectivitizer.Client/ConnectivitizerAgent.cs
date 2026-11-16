@@ -204,8 +204,10 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
 
             try
             {
-                // Jitter keeps a fleet of devices from reconnecting in the same instant after an outage.
-                await Task.Delay(backoff + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500)), stop).ConfigureAwait(false);
+                // Waits a random time between half and the whole back-off. A fleet refused together (an outage, a restart, the platform
+                // shedding load) must not come back together: with only a little jitter it came back in waves 30 s apart that the
+                // platform could not take, with nothing to do in between.
+                await Task.Delay(backoff / 2 + TimeSpan.FromMilliseconds(Random.Shared.NextDouble() * backoff.TotalMilliseconds / 2), stop).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {

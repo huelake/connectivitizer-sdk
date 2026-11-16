@@ -35,6 +35,11 @@ java {
     targetCompatibility = JavaVersion.VERSION_11
 }
 
+// Java sources (only the tests that call the SDK the way a Java program does) compile for the same Java 11.
+tasks.withType<JavaCompile>().configureEach {
+    options.release.set(11)
+}
+
 tasks.test {
     useJUnitPlatform()
     systemProperty("connectivitizer.vectors", rootDir.resolve("../../docs/protocol/vectors").canonicalPath)
@@ -88,12 +93,12 @@ publishing {
         }
     }
     repositories {
-        // What src/examples/pack-local publishes and the web app serves under /downloads/maven.
+        // A local Maven repository, for development builds.
         maven {
             name = "artifacts"
             url = uri(rootDir.resolve("../../artifacts/packages/maven"))
         }
-        // What build/sdk/pack.sh bundles for Maven Central (build/sdk/publish.sh signs it).
+        // The bundle for Maven Central, before it is signed.
         maven {
             name = "staging"
             url = uri(layout.buildDirectory.dir("staging-repo"))
@@ -101,8 +106,8 @@ publishing {
     }
 }
 
-// The interoperability programs (src/test/kotlin/.../interop) run as separate processes from the .NET test
-// suite; it reads their classpath from this file.
+// The interoperability programs (src/test/kotlin/.../interop) run as separate processes; the tests that start
+// them read their classpath from this file.
 tasks.register("interopClasspath") {
     dependsOn("testClasses")
     val output = layout.buildDirectory.file("interop-classpath.txt")
