@@ -87,6 +87,38 @@ await agent.run();                           // until agent.stop()
 
 The device appears in the workspace the first time it connects. One device key serves any number of devices; the name tells them apart.
 
+## A device that calls another device
+
+A device opens sessions to other devices with `agent.connect`, over the connection to the platform it already has. Two things are needed:
+
+- The device key it logs in with has *Its devices may open sessions to other devices* switched on (web app: *Credentials*). Without it, or for a device or service outside the access rules of the key, the platform refuses with `FORBIDDEN`.
+- The device holds the shared key of the other device, in `sharedKey`. With several keys it uses the one named like the other device, else its only one, else the one named `default`.
+
+```ts
+import { createAgent } from '@huelake/connectivitizer';
+
+const agent = createAgent({
+  apiUrl: 'https://…/api/connectivitizer',
+  deviceKey: 'czd_…',                        // a device key that may open sessions
+  name: 'door-bell',
+  sharedKey: 'czs_…',                        // the key the other device has as well
+  services: { api: '127.0.0.1:8080' },
+});
+const running = agent.run();
+
+const session = await agent.connect('hallway-chime', ['api']);   // waits until the device is connected
+await session.fetch('api', '/ring', { method: 'POST' });
+await session.end();
+```
+
+| | |
+|---|---|
+| `agent.connect(device, services)` | Opens a session to another device by its name. The session is the same object `client.connect` returns. |
+| `agent.listDevices()` | The devices this device may reach, without itself. For devices that log in with a device key. |
+| `agent.outgoingSessions` | The sessions this device opened that are still running. `agent.openSessions` are the ones opened to it. |
+
+The device stays reachable while it calls, and `agent.stop()` ends the sessions it opened as well. React Native has no device side, so an app there is a calling application only.
+
 ## React Native
 
 Apps use [`@huelake/connectivitizer-react-native`](https://www.npmjs.com/package/@huelake/connectivitizer-react-native), which brings the native parts (UDP, the phone's own addresses) and a secure random source, so the app passes only `apiUrl`, `auth` and `sharedKey`. [The React Native guide](https://connectivitizer.com/guides/react-native.md) has a complete example. Browsers are not supported: a browser's WebSocket cannot send the headers the platform authenticates by.
@@ -97,7 +129,7 @@ Apps use [`@huelake/connectivitizer-react-native`](https://www.npmjs.com/package
 
 The core (`src/core`) contains no runtime code; a `Platform` (`src/core/platform.ts`) supplies random bytes, `fetch`, a WebSocket with request headers and, for peer to peer, UDP. Getting the UDP part right decides whether sessions can be direct:
 
-- **`localAddresses()`** must return the machine's own addresses: its IPv4 address in the local network (else two endpoints in the same Wi-Fi only meet through the router's public address, which many routers do not loop back) and its global IPv6 addresses (else a phone on mobile data cannot reach a device at home directly, since mobile IPv4 goes through carrier NAT). Skip VPN interfaces.
+- **`localAddresses()`** must return the machine's own addresses: its IPv4 address in the local network (else two endpoints in the same Wi-Fi only meet through the router's public address, which many routers do not loop back) and its global IPv6 addresses (else a phone on mobile data cannot reach a device at home directly, since mobile IPv4 goes through carrier NAT). Skip VPN interfaces. Put the IPv6 address the machine sends from first (connect a UDP socket to a global address and read its own address; nothing is sent), and deprecated ones last: the core announces the first four, and the firewalls on the way open only for the address the probes come from. A machine with a temporary and a stable address per prefix, plus those of a prefix its router replaced, has more than four.
 - **`bind()`** must report the port the socket is really bound to. `react-native-udp` on Android reports the port that was asked for, so `reactNativePlatform` binds it to a random port in 49152-65535 of its own choosing instead of port 0.
 - **The socket should be dual-stack** and say so with `ipv6`; set it false where it is not, so that no IPv6 candidates are announced.
 - **Hosts** passed to `onMessage` are canonical: IPv4 dotted, IPv6 in RFC 5952 form (`normalizeHost`), an IPv4 peer on a dual-stack socket as IPv4.
@@ -139,6 +171,27 @@ An endpoint may have an identity and a shared key at the same time; the platform
 
 This is Node.js only: React Native has no TLS for a stream the app owns.
 
+## Managing a workspace: the command line and the MCP server
+
+The package's command, `connectivitizer`, lists devices and keys, creates keys and sets who may reach what, from a shell or as tools of an AI client. Nothing has to be installed first:
+
+```bash
+npx -y @huelake/connectivitizer login                    # the browser opens; an admin of the workspace approves
+npx -y @huelake/connectivitizer devices
+npx -y @huelake/connectivitizer key create Boards --device --save include/secrets.h:DEVICE_KEY
+npx -y @huelake/connectivitizer key update Boards --sessions on
+npx -y @huelake/connectivitizer keygen --save include/secrets.h:SHARED_KEY --save app/.env:CZ_SHARED_KEY
+npx -y @huelake/connectivitizer sessions --failed
+npx -y @huelake/connectivitizer mcp                      # the same as tools (Model Context Protocol, stdio)
+```
+
+- **Keys are written, not shown.** A command or tool that makes a key puts it into the file named (`.h`: a `#define`; `.json`: a property; `.ps1`: a variable; anything else: `NAME=value`) and answers with name, prefix and path. A shared key is made locally and never sent anywhere.
+- **The sign-in** is a link that asks to manage (`linkApp({ manage: true })`): only an admin can approve it, the key is valid for 30 days, and it can neither create further managing keys nor invite or remove members. It is kept in the state directory (`workspace.json`).
+- **Not offered:** revoking keys and revoking or deleting devices. That stays in the web app.
+- **In code:** `Workspace` is the class behind the commands (`devices()`, `keys()`, `createKey()`, `updateKey()`, `updateDevice()`, `sessions()`), and `writeSecret` / `copySecret` write the files.
+
+An AI client registers the server as `npx -y @huelake/connectivitizer mcp`, with `CONNECTIVITIZER_API_URL` in its environment for an installation other than connectivitizer.com. `CONNECTIVITIZER_NO_BROWSER=1` keeps the browser closed; the address and the code are in the answer of `sign_in`.
+
 ## Shared keys
 
 `npx connectivitizer keygen` prints a new key (`czs_` and 43 characters); the web app's *Credentials* page generates one in the browser. The key goes on the device and into the app, never to Connectivitizer. An endpoint may hold several keys: a device tries each of its keys; a calling app uses the one named like the device, else its only one, else the one named `default`.
@@ -148,7 +201,7 @@ This is Node.js only: React Native has no TLS for a stream the app owns.
 | | |
 |---|---|
 | `src/core` | Everything that does not depend on a runtime: signaling, grants, the shared-key channel (Noise `NNpsk0`), multiplexing, relay path, STUN and hole punching, KCP, HTTP and WebSocket over a session stream. |
-| `src/node` | The Node.js adapter (`node:net`, `node:tls`, `node:dgram`), the certificate layer, the state directory and pairing. |
+| `src/node` | The Node.js adapter (`node:net`, `node:tls`, `node:dgram`), the certificate layer, the state directory and pairing, and the workspace tools with their MCP server. |
 | `src/react-native.ts` | The React Native adapter (built-in `WebSocket` and `fetch`; UDP and random bytes passed in). Apps use `@huelake/connectivitizer-react-native`, which passes them. |
 | `interop/` | Programs for the interoperability tests with the other implementations. |
 
@@ -160,6 +213,8 @@ npm test                # the Noise test vector, KCP, multiplexing, HTTP and Web
 ```
 
 Each release is also tested against the control plane and the relay with the .NET library on the other side, in both directions, relayed and peer to peer, with a shared key and with certificates.
+
+The MCP server is tested against the control plane by a test that plays the client: sign-in, a device key written to a file, the right switched on, and two devices that then call each other. It has not been tried with a particular AI client.
 
 ## Limits
 

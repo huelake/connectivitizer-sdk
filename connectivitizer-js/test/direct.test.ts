@@ -97,6 +97,34 @@ test('a device that announced no usable address is reached at the address its pr
   }
 });
 
+test('the log says what each side announced, what arrived and why no path was found', async () => {
+  const found: string[] = [];
+  const connected = await negotiate('grant-log-1', { peerReflexive: true, log: (line) => found.push(line) }, { peerReflexive: true });
+  try {
+    assert.ok(connected.opened);
+    assert.ok(found.some((line) => line.startsWith('direct: announcing ')), found.join('\n'));
+    assert.ok(found.some((line) => line.startsWith('direct: peer announces ')), found.join('\n'));
+    assert.ok(found.some((line) => line.startsWith('direct: first answer from ')), found.join('\n'));
+    assert.ok(found.some((line) => line.startsWith('direct: path to ')), found.join('\n'));
+  } finally {
+    // The sockets now belong to the paths: closing the attempts leaves them open.
+    connected.opened?.stream.close();
+    connected.accepted?.stream.close();
+    connected.close();
+  }
+
+  const failed: string[] = [];
+  const timedOut = await negotiate('grant-log-2', { peerReflexive: false, announceFilter: () => unreachable, log: (line) => failed.push(line) }, { peerReflexive: false });
+  try {
+    assert.equal(timedOut.opened, null);
+    assert.ok(failed.some((line) => line.startsWith('direct: no STUN server to ask')), failed.join('\n'));
+    const last = failed.at(-1) ?? '';
+    assert.match(last, /^direct: no path within 3000 ms \(probing, no answer from the peer yet\); sent \d+ probes to .+, received \d+ probes and 0 answers; reason udp_blocked_local$|reason stun_unreachable$/);
+  } finally {
+    timedOut.close();
+  }
+});
+
 test('without peer-reflexive, an address nobody announced is never used', async () => {
   const run = await negotiate('grant-prflx-3', { peerReflexive: false, announceFilter: () => unreachable }, { peerReflexive: false });
   try {

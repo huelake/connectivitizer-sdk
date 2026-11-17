@@ -41,7 +41,12 @@ export interface DirectAttemptOptions {
   peerReflexive?: boolean;
   /** Test hook: changes the UDP candidates before they are announced. */
   announceFilter?: (candidates: string[]) => string[];
+  /** Diagnostics: one line per step (STUN answers, candidates, probes). The lines contain network addresses. */
+  log?: (line: string) => void;
 }
+
+/** First datagrams from new addresses that are logged per attempt; more would only repeat the picture. */
+const MAX_LOGGED_SOURCES = 12;
 
 /**
  * Whether a session with this end-to-end layer may use learned addresses: only when the layer
@@ -138,6 +143,10 @@ export class DirectAttempt {
   private hasStunServers = false;
   private handedOver = false;
   private closed = false;
+  private probesSent = 0;
+  private probesReceived = 0;
+  private acksReceived = 0;
+  private readonly loggedSources = new Set<string>();
 
   constructor(
     private readonly platform: Platform,
@@ -153,17 +162,37 @@ export class DirectAttempt {
     this.conversation = (readUint32(digest, 8) | 1) >>> 0;
   }
 
+  /** What this side of the attempt sent and saw, for the log when no path was found. */
+  summary(): string {
+    return `sent ${this.probesSent} probes to ${this.probeTargets().map(formatAddress).join(', ') || '(nothing)'}; `
+      + `received ${this.probesReceived} probes and ${this.acksReceived} answers`;
+  }
+
+  private log(text: string): void {
+    try {
+      this.options.log?.(`direct: ${text}`);
+    } catch {
+      // Diagnostics must never break the attempt.
+    }
+  }
+
   /** Discovers this endpoint's addresses and returns the candidate list to send to the peer. */
   async gather(): Promise<Uint8Array> {
     const udp = this.platform.udp!;
     this.socket = await udp.bind();
     this.socket.onMessage = (data, host, port) => this.onDatagram(data, host, port);
+    this.log(`UDP socket on port ${this.socket.port}, IPv6 ${this.socket.ipv6 ? 'yes' : 'no'}`);
 
     const mapped = await this.discover();
     let candidates: string[] = [];
     let ipv4 = 0;
     let ipv6 = 0;
-    for (const text of await udp.localAddresses().catch(() => [] as string[])) {
+    const local = await udp.localAddresses().catch((error: unknown) => {
+      this.log(`local addresses could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      return [] as string[];
+    });
+    this.log(`local addresses: ${local.length === 0 ? '(none)' : local.join(', ')}`);
+    for (const text of local) {
       const host = normalizeHost(text);
       if (!host) {
         continue;
@@ -191,6 +220,7 @@ export class DirectAttempt {
     };
     const blob = utf8Encode(JSON.stringify(list));
     this.localCandidatesHash = toHex(sha256(blob));
+    this.log(`announcing ${candidates.length === 0 ? '(no candidates)' : candidates.join(', ')}; NAT ${list.nat}`);
     return blob;
   }
 
@@ -200,11 +230,14 @@ export class DirectAttempt {
     try {
       list = JSON.parse(utf8Decode(blob)) as CandidateList;
     } catch {
+      this.log('the peer\'s candidate list is not readable');
       return false;
     }
     if (!list || list.sid !== this.sessionId || list.role === this.role || !Array.isArray(list.udp) || list.udp.length > MAX_CANDIDATES) {
+      this.log('the peer\'s candidate list is not for this session or not usable');
       return false;
     }
+    this.log(`peer announces ${list.udp.length === 0 ? '(no candidates)' : list.udp.join(', ')}; NAT ${String(list.nat)}`);
     this.remoteCandidatesHash = toHex(sha256(blob));
     this.remoteNat = typeof list.nat === 'string' ? list.nat : 'unknown';
     const parsed: UdpAddress[] = [];
@@ -257,12 +290,16 @@ export class DirectAttempt {
    * use. Returns that path, or null when none worked in time.
    */
   async open(budgetMs: number): Promise<DirectPath | null> {
-    const deadline = Date.now() + budgetMs;
+    const started = Date.now();
+    const deadline = started + budgetMs;
     const remaining = () => Math.max(deadline - Date.now(), 1);
     let stop = false;
+    let step = 'waiting for the peer\'s candidates';
     const expired = () => new Error('no direct path in time');
     try {
       await withTimeout(this.remoteKnown.promise, remaining(), expired);
+      this.log(`peer's candidates after ${Date.now() - started} ms; probing`);
+      step = 'probing, no answer from the peer yet';
       void this.probeLoop(FLAG_PROBE, () => this.probeTargets(), () => stop || this.selected !== null);
 
       // A learned address is the fallback: it is selected only if no announced candidate answers in time.
@@ -270,15 +307,21 @@ export class DirectAttempt {
       learned.catch(() => undefined);
       const remote = await withTimeout(Promise.race([this.validated.promise, learned]), remaining(), expired);
       this.selected = remote;
+      this.log(`${formatAddress(remote)} answered after ${Date.now() - started} ms (${this.isRemoteCandidate(remote) ? 'announced' : 'learned'}); selecting it`);
+      step = `selecting ${formatAddress(remote)}, no acknowledgement yet`;
       void this.probeLoop(FLAG_SELECT, () => [remote], () => stop);
       await withTimeout(this.selectAcknowledged.promise, remaining(), expired);
 
       stop = true;
       this.handedOver = true;
       this.path = new KcpPath(this.socket!, remote.host, remote.port, this.conversation);
+      this.log(`path to ${formatAddress(remote)} after ${Date.now() - started} ms`);
       return { stream: this.path.stream, peerAddress: this.path.peerAddress };
     } catch {
       stop = true;
+      this.log(`no path within ${budgetMs} ms (${step}); sent ${this.probesSent} probes to `
+        + `${this.probeTargets().map(formatAddress).join(', ') || '(nothing)'}, received ${this.probesReceived} probes and ${this.acksReceived} answers`
+        + `${this.learned.length > 0 ? `; learned ${this.learned.map(formatAddress).join(', ')}` : ''}; reason ${this.failureReason()}`);
       return null;
     }
   }
@@ -347,6 +390,7 @@ export class DirectAttempt {
     }
     this.hasStunServers = servers.length > 0;
     if (servers.length === 0) {
+      this.log(`no STUN server to ask (given: ${this.stunServers.length === 0 ? 'none' : this.stunServers.join(', ')})`);
       return null;
     }
 
@@ -379,6 +423,8 @@ export class DirectAttempt {
     const answers = this.stunTransactions.map((t) => t.answer).filter((answer): answer is string => answer !== null);
     this.stunReachable = answers.length > 0;
     this.stunSymmetric = new Set(answers).size > 1;
+    this.log(`STUN after ${Date.now() - started} ms: ${servers.map((server, index) => `${formatAddress(server)} -> ${this.stunTransactions[index].answer ?? 'no answer'}`).join(', ')}`
+      + ` (${!this.stunReachable ? 'unreachable' : this.stunSymmetric ? 'different public ports: symmetric NAT' : 'one public address: cone'})`);
     return answers[0] ?? null;
   }
 
@@ -406,6 +452,16 @@ export class DirectAttempt {
     this.learn(from);
     const announced = this.isRemoteCandidate(from);
     const flags = data[9];
+    if (data[0] === DatagramType.Probe) {
+      this.probesReceived++;
+    } else {
+      this.acksReceived++;
+    }
+    const source = `${data[0] === DatagramType.Probe ? 'probe' : 'answer'} ${formatAddress(from)}`;
+    if (!this.loggedSources.has(source) && this.loggedSources.size < MAX_LOGGED_SOURCES) {
+      this.loggedSources.add(source);
+      this.log(`first ${source.replace(' ', ' from ')} (${announced ? 'announced' : this.isLearned(from) ? 'learned' : 'not announced'})`);
+    }
     if (data[0] === DatagramType.Probe) {
       if (flags === FLAG_SELECT) {
         // Only the initiator selects, and only an address from its own announced list (or, where
@@ -452,6 +508,7 @@ export class DirectAttempt {
       for (const target of targets()) {
         try {
           this.socket?.send(probe.slice(), target.host, target.port);
+          this.probesSent++;
         } catch {
           // An address this machine cannot send to is just one that does not work.
         }

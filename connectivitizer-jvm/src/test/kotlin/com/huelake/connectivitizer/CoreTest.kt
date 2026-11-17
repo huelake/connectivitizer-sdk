@@ -2,9 +2,12 @@ package com.huelake.connectivitizer
 
 import com.huelake.connectivitizer.internal.Bytes
 import com.huelake.connectivitizer.internal.ChunkQueue
+import com.huelake.connectivitizer.internal.DatagramType
+import com.huelake.connectivitizer.internal.DirectAttempt
 import com.huelake.connectivitizer.internal.Json
 import com.huelake.connectivitizer.internal.Kcp
 import com.huelake.connectivitizer.internal.MuxSession
+import com.huelake.connectivitizer.internal.Roles
 import com.huelake.connectivitizer.internal.Stun
 import com.huelake.connectivitizer.internal.Yamux
 import com.huelake.connectivitizer.internal.asList
@@ -15,9 +18,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.io.File
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.security.SecureRandom
 import kotlin.random.Random
 import kotlin.test.Test
@@ -194,6 +202,33 @@ class CoreTest {
         sender.send(byteArrayOf(1))
         sender.update(100)
         assertTrue(Kcp(2) {}.input(other[0]) < 0)
+    }
+
+    @Test
+    fun directAttemptLogsWhatItAnnouncedSentAndSaw() = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lines = ArrayList<String>()
+        val attempt = DirectAttempt(Platform(), Roles.DEVICE, "s1", "grant", emptyList(), false, scope) { lines.add(it) }
+        DatagramSocket(0, InetAddress.getLoopbackAddress()).use { peer ->
+            attempt.gather()
+            val port = Regex("^UDP socket on port (\\d+), IPv6 (yes|no); STUN: no answer$").matchEntire(lines[0])!!.groupValues[1].toInt()
+            assertTrue(lines[1].startsWith("announcing "), lines[1])
+            val candidate = "127.0.0.1:${peer.localPort}"
+            assertTrue(attempt.setRemoteCandidates(Json.write(mapOf("sid" to "s1", "role" to Roles.INITIATOR, "udp" to listOf(candidate), "nat" to "cone")).toByteArray()))
+            assertTrue(Regex("^after \\d+ ms: sent 0 probes to ${Regex.escape(candidate)}; received 0 probes and 0 answers$").matches(attempt.summary()), attempt.summary())
+
+            val probe = byteArrayOf(DatagramType.PROBE.toByte()) + Bytes.sha256("grant".toByteArray()).copyOfRange(0, 8) + ByteArray(9)
+            for (datagram in listOf(probe.copyOf().also { it[1] = (it[1] + 1).toByte() }, probe)) {
+                peer.send(DatagramPacket(datagram, datagram.size, InetAddress.getLoopbackAddress(), port))
+            }
+            withTimeout(5_000) { while (lines.size < 5) delay(10) }
+            assertTrue(Regex("^peer announces ${Regex.escape(candidate)}; NAT cone; after \\d+ ms$").matches(lines[2]), lines[2])
+            assertEquals(setOf("probing them from: 127.0.0.1 <- 127.0.0.1"), lines.filter { it.startsWith("probing") }.toSet())
+            assertTrue(lines.any { Regex("^first probe from ${Regex.escape(candidate)} \\(announced\\) after \\d+ ms$").matches(it) }, lines.toString())
+            assertTrue(Regex("^after \\d+ ms: sent 0 probes to ${Regex.escape(candidate)}; received 1 probes and 0 answers, 1 other datagrams$").matches(attempt.summary()), attempt.summary())
+        }
+        attempt.close()
+        scope.coroutineContext[kotlinx.coroutines.Job]!!.cancel()
     }
 
     @Test

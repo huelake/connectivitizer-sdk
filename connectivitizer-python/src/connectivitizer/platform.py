@@ -5,6 +5,7 @@ here has to be configured: an application never passes addresses or sockets."""
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
 import os
 import platform as system
@@ -15,13 +16,15 @@ import sys
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from .direct.addresses import is_ipv6, normalize_host
+from .direct.addresses import UdpAddress, format_address, is_ipv6, normalize_host
 from .errors import ConnectivitizerError, ErrorCodes
 from .http import http_request
 from .streams import ByteStream
 from .websocket import StreamWebSocket, WebSocketRefusedError
 
 READ_SIZE = 64 * 1024
+SEND_REFUSALS = (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT)
+"""The errors with which the system refuses to send a datagram to an address it has no way to reach."""
 
 
 class SocketStream(ByteStream):
@@ -80,17 +83,38 @@ class UdpSocket:
         self.ipv6 = ipv6
         """The socket can also reach IPv6 addresses."""
         self.on_message: Optional[Callable[[bytes, str, int], None]] = None
+        self.send_failures = 0
+        """Datagrams that were not sent (no route, no address of that family, ...)."""
+        self.first_send_failure: Optional[str] = None
+        """The first destination a send failed for and why; None when every send went out."""
+        self._sending: Optional[str] = None
 
     def send(self, data: bytes, host: str, port: int) -> None:
+        self._sending = format_address(UdpAddress(host, port))
+        try:
+            self._send(data, host, port)
+        finally:
+            self._sending = None
+
+    def _send(self, data: bytes, host: str, port: int) -> None:
         if is_ipv6(host) and not self.ipv6:
+            self.send_failed("the socket has no IPv6")
             return  # an IPv6 candidate this socket cannot reach
         # A dual-stack socket reaches an IPv4 peer by its IPv4-mapped address.
         # The full IPv6 address tuple: Windows' proactor refuses a (host, port) pair on an IPv6 socket.
         target = (f"::ffff:{host}" if not is_ipv6(host) else host, port, 0, 0) if self.ipv6 else (host, port)
         try:
             self._transport.sendto(data, target)
-        except (OSError, ValueError):
-            pass  # no route to that address: just a candidate that does not work
+        except (OSError, ValueError) as error:
+            # No route to that address: just a candidate that does not work.
+            self.send_failed(_error_name(error))
+
+    def send_failed(self, reason: str) -> None:
+        """Counts a datagram that was not sent. The event loop reports some refusals only after ``send``
+        has returned; the destination is then not known and the first failure names the reason alone."""
+        self.send_failures += 1
+        if self.send_failures == 1:
+            self.first_send_failure = f"{self._sending}: {reason}" if self._sending else reason
 
     def close(self) -> None:
         self._transport.close()
@@ -106,7 +130,14 @@ class _UdpProtocol(asyncio.DatagramProtocol):
             self.socket.on_message(data, host, address[1])
 
     def error_received(self, exc: Exception) -> None:
-        pass  # ICMP errors for one candidate say nothing about the others
+        # ICMP errors for one candidate say nothing about the others; a refused send is only counted.
+        if self.socket is not None and isinstance(exc, OSError) and exc.errno in SEND_REFUSALS:
+            self.socket.send_failed(_error_name(exc))
+
+
+def _error_name(error: Exception) -> str:
+    code = error.errno if isinstance(error, OSError) else None
+    return errno.errorcode.get(code, str(error)) if code is not None else str(error)
 
 
 class Platform:
@@ -259,6 +290,16 @@ class Platform:
         if self._include_loopback:
             add("127.0.0.1")
         return found
+
+    def source_address(self, host: str) -> Optional[str]:
+        """The local address the system sends from to reach an address, by its routing table. Asked with a
+        socket that is only given the destination: nothing is sent. None without a route."""
+        try:
+            with socket.socket(socket.AF_INET6 if is_ipv6(host) else socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((host, 9))
+                return normalize_host(sock.getsockname()[0])
+        except (OSError, ValueError):
+            return None
 
     async def resolve(self, host: str) -> str:
         """The IPv4 address of a host name (for STUN servers given by name)."""

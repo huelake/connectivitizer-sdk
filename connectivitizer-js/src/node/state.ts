@@ -3,7 +3,7 @@
 // pairing can travel between a Node.js endpoint and a `cz` endpoint in either direction.
 
 import { createHash, createHmac, createPrivateKey, createPublicKey, generateKeyPairSync, type KeyObject, randomBytes, sign, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ServiceOptions } from '../core/agent.js';
@@ -21,6 +21,7 @@ const SHARED_KEYS_FILE = 'sharedkeys.json';
 const DEVICE_FILE = 'device.json';
 const AUTH_KEY_FILE = 'auth.key.pem';
 const SERVICES_FILE = 'services.json';
+const WORKSPACE_FILE = 'workspace.json';
 
 /** What `cz device login` or `cz device enroll` recorded about this machine as a device. */
 export interface DeviceRegistration {
@@ -31,6 +32,19 @@ export interface DeviceRegistration {
   slug?: string;
   /** Present for a device that logs in with a device key. */
   deviceKey?: string;
+}
+
+/** A sign-in of this installation to a workspace, with a key that may manage it (`connectivitizer login`). */
+export interface WorkspaceLogin {
+  apiUrl: string;
+  apiKey: string;
+  workspaceId: string;
+  workspaceName: string;
+  /** The name the key has in the workspace. */
+  client: string;
+  credentialId: string;
+  /** When the key stops working (ISO 8601). */
+  expiresAt?: string;
 }
 
 interface PendingPairing {
@@ -136,6 +150,19 @@ export class StateDirectory {
   loadServices(): Record<string, ServiceOptions> {
     const services = this.readJson<{ services?: { name: string; target: string; protocol?: string; allow?: string[] }[] }>(SERVICES_FILE)?.services ?? [];
     return Object.fromEntries(services.map((service) => [service.name, { target: service.target, protocol: service.protocol ?? 'tcp', allow: service.allow ?? undefined }]));
+  }
+
+  /** The workspace this installation is signed in to, if any. */
+  loadWorkspaceLogin(): WorkspaceLogin | null {
+    return this.readJson<WorkspaceLogin>(WORKSPACE_FILE);
+  }
+
+  saveWorkspaceLogin(login: WorkspaceLogin): void {
+    this.writePrivate(WORKSPACE_FILE, JSON.stringify(login, null, 2));
+  }
+
+  removeWorkspaceLogin(): void {
+    rmSync(this.file(WORKSPACE_FILE), { force: true });
   }
 
   /** @internal */

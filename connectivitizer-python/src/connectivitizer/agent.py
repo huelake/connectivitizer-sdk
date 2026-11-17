@@ -1,6 +1,7 @@
 """The device side: keeps an outbound connection to the platform, and when an authorised application that
 holds the shared key asks, opens a session and forwards its streams to local services. Nothing is reachable
-that the device did not declare itself, and no port listens."""
+that the device did not declare itself, and no port listens. A device can also open sessions to other devices,
+over the same connection to the platform, when the device key it logs in with has the right to connect."""
 
 from __future__ import annotations
 
@@ -11,8 +12,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .api import GrantVerifier, PlatformApi, TokenResponse
-from .client import SharedKeys, to_keys
+from .api import GrantVerifier, PlatformApi, ReachableDevice, TokenResponse
+from .client import ConnectivitizerClient, SharedKeys, to_keys
 from .direct.attempt import DirectAttempt, peer_reflexive_for
 from .errors import ConnectivitizerError, ErrorCodes, code_of
 from .grants import Capabilities, ConnectionModes, E2eMethods, Grant, Roles, e2e_method_of
@@ -56,6 +57,8 @@ class ConnectivitizerAgent:
         agent = ConnectivitizerAgent(api_url, device_key="czd_...", name="nas", shared_key="czs_...",
                                      services={"api": "127.0.0.1:8080"}, log=print)
         await agent.run()   # until agent.stop()
+
+    While it runs, the device can open sessions to other devices with :meth:`connect`.
     """
 
     def __init__(
@@ -100,6 +103,21 @@ class ConnectivitizerAgent:
         self._stopped = False
         self._stop_signal: Optional[asyncio.Future] = None
         self._connected = asyncio.Event()
+        self._halted = asyncio.Event()
+        """Set once the device is stopped or the platform refused it for good."""
+        self._halt_code: str = ErrorCodes.SESSION_CLOSED
+        # The calling half. It uses the device's signaling connection instead of logging in itself.
+        self._caller = ConnectivitizerClient(
+            api_url,
+            shared_key=self._keys,
+            disable_direct=disable_direct,
+            stun_servers=stun_servers,
+            platform=self._platform,
+            _signaling=self._current_signaling,
+            _opened=self._forget_negotiation,
+            _log=log,
+            _now_seconds=self._now_seconds,
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -111,8 +129,51 @@ class ConnectivitizerAgent:
         """The sessions currently open to this device."""
         return [session.info for session in self._sessions.values()]
 
+    @property
+    def outgoing_sessions(self) -> List[ConnectionInfo]:
+        """The sessions this device opened to other devices that are still running."""
+        return self._caller._open_sessions
+
     async def wait_until_connected(self) -> None:
         await self._connected.wait()
+
+    async def connect(self, device: str, services: List[str]) -> TunnelSession:
+        """Opens a session from this device to ``device`` (its name or id) for the named services, over the
+        device's own connection to the platform; it waits until the device is connected. The platform refuses
+        with ``FORBIDDEN`` unless the device key this device logs in with may connect and its access rules
+        cover the request. The shared key is chosen as an application chooses it: the one named like the
+        other device, else the only one, else the one named ``default``. Raises :class:`ConnectivitizerError`
+        like :meth:`ConnectivitizerClient.connect`."""
+        return await self._caller.connect(device, services)
+
+    async def list_devices(self) -> List[ReachableDevice]:
+        """The devices this device may open sessions to, with the services it may use. Needs a device key
+        that may connect."""
+        token = await self._api.device_key_token(self._device_key, self._name, self._platform.description, self._agent_version)
+        return await self._api.reachable_devices(token.access_token)
+
+    async def _current_signaling(self) -> SignalingClient:
+        """The device's signaling connection, once it is connected. Raises when the device is stopped or the
+        platform does not accept it, because no connection will come then."""
+        while True:
+            if self._halted.is_set():
+                raise ConnectivitizerError(self._halt_code, "The device is not running, so it cannot open sessions.")
+            if self._connected.is_set() and self._signaling is not None and self._signaling.is_open:
+                return self._signaling
+            if self._connected.is_set():
+                await asyncio.sleep(0.05)  # the connection closed a moment ago; run() notices next
+                continue
+            waits = [asyncio.ensure_future(self._connected.wait()), asyncio.ensure_future(self._halted.wait())]
+            try:
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for waiting in waits:
+                    waiting.cancel()
+
+    def _forget_negotiation(self, session_id: str) -> None:
+        """The opening of a session this device asked for is over: what its signals left behind is dropped."""
+        self._candidates.pop(session_id, None)
+        self._fallbacks.pop(session_id, None)
 
     async def run(self) -> None:
         """Runs until :meth:`stop` is called, reconnecting with back-off whenever the connection to the platform
@@ -152,11 +213,14 @@ class ConnectivitizerAgent:
                 self._log(f"disconnected from the platform ({reason})")
                 if reason in (ErrorCodes.DEVICE_REVOKED, ErrorCodes.CREDENTIAL_REVOKED):
                     await self._end_all_sessions(reason)
+                    await self._caller._end_all(reason)
                     raise ConnectivitizerError(reason, "This device was revoked." if reason == ErrorCodes.DEVICE_REVOKED else "The device key this device logs in with was revoked.")
             except ConnectivitizerError as error:
                 final = (ErrorCodes.DEVICE_REVOKED, ErrorCodes.CREDENTIAL_REVOKED, ErrorCodes.IDENTITY_NOT_REGISTERED, ErrorCodes.UNAUTHENTICATED, ErrorCodes.INVALID_REQUEST, ErrorCodes.CONFLICT)
                 if error.code in final:
                     self._log(f"the platform does not accept this device ({error.code})")
+                    self._halt_code = error.code
+                    self._halted.set()
                     raise
                 self._log(f"platform unavailable ({error.code}); retrying in {round(backoff)} s")
             except (OSError, ValueError) as error:
@@ -174,7 +238,9 @@ class ConnectivitizerAgent:
         if self._stopped:
             return
         self._stopped = True
+        self._halted.set()
         await asyncio.gather(*(session.close() for session in list(self._sessions.values())), return_exceptions=True)
+        await self._caller.close()  # ends the sessions this device opened; the connection stays the device's
         await asyncio.sleep(0.05)
         if self._signaling is not None:
             await self._signaling.close()
@@ -199,7 +265,13 @@ class ConnectivitizerAgent:
         kind = message.get("t")
         if kind == "connect.offer" and session_id and isinstance(data.get("grant"), str) and isinstance(data.get("peer"), dict):
             spawn(self._handle_offer(signaling, data))
+        elif kind == "connect.answer":
+            self._caller._on_signal(message)
         elif kind == "path.candidates" and session_id and isinstance(data.get("blob"), str):
+            # The candidates of a session this device opened belong to the calling half.
+            self._caller._on_signal(message)
+            if self._caller._owns(session_id):
+                return
             try:
                 settle(self._waiter(self._candidates, session_id), base64.b64decode(data["blob"], validate=True))
             except ValueError:
@@ -207,6 +279,7 @@ class ConnectivitizerAgent:
         elif kind == "path.fallback" and session_id:
             settle(self._waiter(self._fallbacks, session_id), data.get("reason") if isinstance(data.get("reason"), str) else "unknown")
         elif kind == "revoke":
+            self._caller._on_signal(message)
             sids = data.get("sids") if isinstance(data.get("sids"), list) else None
             reason = data.get("reason") if isinstance(data.get("reason"), str) else ErrorCodes.SESSION_REVOKED
             for session in list(self._sessions.values()):
@@ -293,7 +366,15 @@ class ConnectivitizerAgent:
 
         if self._direct_possible(grant, peer):
             stun = self._stun_servers if self._stun_servers is not None else (signaling.welcome.get("stunServers") or [])
-            attempt = DirectAttempt(self._platform, Roles.DEVICE, session_id, offer["grant"], stun, peer_reflexive=peer_reflexive_for(e2e_method_of(grant)))
+            attempt = DirectAttempt(
+                self._platform,
+                Roles.DEVICE,
+                session_id,
+                offer["grant"],
+                stun,
+                peer_reflexive=peer_reflexive_for(e2e_method_of(grant)),
+                log=lambda message: self._log(f"session {session_id}: direct: {message}"),
+            )
             try:
 
                 async def apply_candidates() -> None:
@@ -341,9 +422,11 @@ class ConnectivitizerAgent:
                     except Exception:
                         pass
                     self._log(f"session {session_id}: no direct path ({fallback.result()}), using the relay")
+                    self._log(f"session {session_id}: direct: {attempt.summary()}")
                 elif fallback.done() and fallback.exception() is None:
                     selection.cancel()
                     self._log(f"session {session_id}: no direct path ({fallback.result()}), using the relay")
+                    self._log(f"session {session_id}: direct: {attempt.summary()}")
                 else:
                     raise selection.exception() or expired()  # type: ignore[misc]
             finally:

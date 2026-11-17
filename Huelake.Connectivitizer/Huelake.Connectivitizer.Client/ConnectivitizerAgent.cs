@@ -92,6 +92,8 @@ public sealed class ConnectivitizerAgentOptions
 /// Nothing is reachable that the device did not declare itself. No port listens permanently: only
 /// while a direct connection is being set up does a TCP port accept the peer of that session, and
 /// it answers nothing that does not present that session's tag (switch off with <c>TcpListenPort = -1</c>).
+/// A device can also open sessions to other devices (<see cref="ConnectAsync"/>), over the same connection
+/// to the platform, when the device key it logs in with has the right to connect.
 /// </summary>
 public sealed class ConnectivitizerAgent : IAsyncDisposable
 {
@@ -108,6 +110,7 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
     private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _fallbacks = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _stop = new();
     private TaskCompletionSource _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly ConnectivitizerClient _caller;
     private SignalingClient? _signaling;
     private string? _deviceId;
 
@@ -131,6 +134,28 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
         // name end-to-end peers and do not apply to it - the opt-in is the permission.
         _compatibilityServices = StateDirectory.ToDirectory(options.Services.Where(s => s.Compatibility).Select(s => s with { Allow = null }));
         _tcpListener = !options.DisableDirect && options.DirectTransports.HasFlag(DirectTransports.Tcp) ? new TcpDirectListener(options.TcpListenPort) : null;
+        _caller = new ConnectivitizerClient(new ConnectivitizerClientOptions
+        {
+            ApiUrl = options.ApiUrl,
+            HttpClient = options.HttpClient,
+            Identity = options.Identity,
+            SharedKeys = options.SharedKeys,
+            Trust = options.Trust,
+            AllowPlatformIntroducedPeers = options.AllowPlatformIntroducedPeers,
+            DisableDirect = options.DisableDirect,
+            StunServers = options.StunServers,
+            IncludeLoopbackCandidates = options.IncludeLoopbackCandidates,
+            DirectTransports = options.DirectTransports,
+            PublicTcpEndpoints = options.PublicTcpEndpoints,
+            TcpListener = _tcpListener,
+            Signaling = CurrentSignalingAsync,
+            Opened = sessionId =>
+            {
+                _candidates.TryRemove(sessionId, out _);
+                _fallbacks.TryRemove(sessionId, out _);
+            },
+            Log = options.Log,
+        });
     }
 
     /// <summary>True while the device is connected to the platform and can be reached.</summary>
@@ -138,6 +163,43 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
 
     /// <summary>The sessions currently open to this device.</summary>
     public IReadOnlyCollection<ConnectionInfo> Sessions => _sessions.Values.Select(s => s.Info).ToArray();
+
+    /// <summary>The sessions this device opened to other devices that are still running.</summary>
+    public IReadOnlyCollection<ConnectionInfo> OutgoingSessions => _caller.Sessions;
+
+    /// <summary>
+    /// Opens a session from this device to <paramref name="device"/> (id or slug) for the named services, over the
+    /// device's own connection to the platform; it waits until the device is connected. The platform refuses with
+    /// <c>FORBIDDEN</c> unless the device key this device logs in with may connect and its access rules cover the
+    /// request. The shared key is chosen as an application chooses it: the one named like the other device, else
+    /// the only one, else the one named "default". Errors are those of <see cref="ConnectivitizerClient.ConnectAsync"/>.
+    /// </summary>
+    public Task<TunnelSession> ConnectAsync(string device, IEnumerable<string> services, CancellationToken cancellationToken = default)
+        => _caller.ConnectAsync(device, services, cancellationToken);
+
+    /// <summary>The devices this device may open sessions to, with the services it may use. Needs a device key that may connect.</summary>
+    public async Task<IReadOnlyList<ReachableDevice>> ListDevicesAsync(CancellationToken cancellationToken = default)
+    {
+        if (_options.DeviceKey is not { } deviceKey)
+        {
+            throw new PlatformException(ErrorCodes.Forbidden, "Only a device that logs in with a device key can open sessions.");
+        }
+        TokenResponse token = await _api.GetDeviceKeyTokenAsync(deviceKey, _options.DeviceName!, _options.Identity, RuntimeInformation.OSDescription, _options.AgentVersion, cancellationToken).ConfigureAwait(false);
+        return await _api.GetReachableDevicesAsync(token.AccessToken, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<SignalingClient> CurrentSignalingAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            await _connected.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (_signaling is { Closed.IsCompleted: false } signaling)
+            {
+                return signaling;
+            }
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        }
+    }
 
     /// <summary>Completes when the agent is connected to the platform.</summary>
     public Task WaitUntilConnectedAsync(CancellationToken cancellationToken = default) => _connected.Task.WaitAsync(cancellationToken);
@@ -184,6 +246,7 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
                     if (reason is ErrorCodes.DeviceRevoked or ErrorCodes.CredentialRevoked)
                     {
                         await EndAllSessionsAsync(reason).ConfigureAwait(false);
+                        await _caller.EndAllAsync(reason).ConfigureAwait(false);
                         throw new PlatformException(reason, reason == ErrorCodes.DeviceRevoked ? "This device was revoked." : "The device key this device logs in with was revoked.");
                     }
                 }
@@ -227,7 +290,17 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
                     await HandleOfferAsync(offer).ConfigureAwait(false);
                     break;
 
+                case SignalTypes.ConnectAnswer:
+                    await _caller.OnSignalAsync(message).ConfigureAwait(false);
+                    break;
+
                 case SignalTypes.PathCandidates when message.Data is { } data && data.Deserialize(ProtocolJsonContext.Default.SignalPathCandidates) is { } candidates:
+                    // The candidates of a session this device opened belong to the calling half.
+                    await _caller.OnSignalAsync(message).ConfigureAwait(false);
+                    if (_caller.Owns(candidates.SessionId))
+                    {
+                        break;
+                    }
                     try
                     {
                         _candidates.GetOrAdd(candidates.SessionId, _ => new(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult(Convert.FromBase64String(candidates.Blob));
@@ -242,6 +315,7 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
                     break;
 
                 case SignalTypes.Revoke when message.Data is { } data && data.Deserialize(ProtocolJsonContext.Default.SignalRevoke) is { } revoke:
+                    await _caller.OnSignalAsync(message).ConfigureAwait(false);
                     foreach (TunnelSession session in _sessions.Values.Where(s => revoke.SessionIds is null || revoke.SessionIds.Contains(s.Info.SessionId)).ToArray())
                     {
                         Log($"session {session.Info.SessionId} revoked by the platform ({revoke.Reason})");
@@ -371,6 +445,7 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
                 TcpListener = _tcpListener,
                 PublicTcpEndpoints = tcp ? await StunClient.ResolveAsync(_options.PublicTcpEndpoints, stop).ConfigureAwait(false) : [],
                 PeerReflexive = DirectAttemptOptions.PeerReflexiveFor(grant),
+                Log = message => Log($"session {sessionId}: direct: {message}"),
             });
             using var pathTimeout = CancellationTokenSource.CreateLinkedTokenSource(stop);
             pathTimeout.CancelAfter(PathTimeout);
@@ -419,6 +494,7 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
                     await path.DisposeAsync().ConfigureAwait(false);
                 }
                 Log($"session {sessionId}: no direct path ({await fallback.ConfigureAwait(false)}), using the relay");
+                Log($"session {sessionId}: direct: {attempt.Summary()}");
             }
             catch (OperationCanceledException) when (!stop.IsCancellationRequested)
             {
@@ -538,6 +614,7 @@ public sealed class ConnectivitizerAgent : IAsyncDisposable
         {
             await session.DisposeAsync().ConfigureAwait(false);
         }
+        await _caller.DisposeAsync().ConfigureAwait(false);
         if (_tcpListener is not null)
         {
             await _tcpListener.DisposeAsync().ConfigureAwait(false);

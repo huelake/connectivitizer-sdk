@@ -13,7 +13,9 @@ import { type NodePlatformOptions, nodePlatform } from './node/platform.js';
 export * from './core/index.js';
 export { type CertificateOptions, EndpointIdentity, type TrustedIdentity, type TrustOrigin, TrustStore, certificateSupport, fingerprintOfPem, normalizeFingerprint } from './node/certificates.js';
 export { type NodePlatformOptions, nodePlatform, socketStream } from './node/platform.js';
-export { type DeviceRegistration, StateDirectory, acceptInvitation, agentOptionsFrom, completePairing, createInvitation, enrollDevice } from './node/state.js';
+export { type DeviceRegistration, StateDirectory, type WorkspaceLogin, acceptInvitation, agentOptionsFrom, completePairing, createInvitation, enrollDevice } from './node/state.js';
+export { type SecretPlace, type SecretWritten, copySecret, writeSecret } from './node/secretFiles.js';
+export { type DeviceView, type KeyView, type Reach, type SessionView, Workspace } from './node/workspace.js';
 
 /**
  * What Node.js adds to the options of a client or an agent: the certificate layer. With

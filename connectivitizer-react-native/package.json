@@ -1,6 +1,6 @@
 {
   "name": "@huelake/connectivitizer-react-native",
-  "version": "1.0.50",
+  "version": "1.0.59",
   "description": "Connectivitizer for React Native apps: reach services on devices behind NAT, end-to-end encrypted, peer to peer or relayed. Brings the native UDP and network access peer-to-peer sessions need.",
   "license": "MIT",
   "author": "Huelake Software Solutions UG (haftungsbeschränkt) <info@huelake.com>",

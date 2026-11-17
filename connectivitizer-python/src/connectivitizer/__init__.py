@@ -42,7 +42,7 @@ def new_shared_key() -> str:
     return generate_shared_key()
 
 
-__version__ = "1.0.50"
+__version__ = "1.0.59"
 
 __all__ = [
     "Agent",

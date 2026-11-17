@@ -125,7 +125,11 @@ public sealed class PlatformApi
 
     /// <summary>An application asks to be linked to somebody's account. Nothing is granted until that person approves in the web app.</summary>
     public Task<LinkStartResponse> StartLinkAsync(string client, string? platform, CancellationToken cancellationToken)
-        => PostAsync("v1/auth/link", new LinkStartRequest { Client = client, Platform = platform }, ProtocolJsonContext.Default.LinkStartRequest, ProtocolJsonContext.Default.LinkStartResponse, cancellationToken);
+        => StartLinkAsync(client, platform, false, cancellationToken);
+
+    /// <summary>The same, for a tool that asks to manage the workspace as well. Only an admin can approve that.</summary>
+    public Task<LinkStartResponse> StartLinkAsync(string client, string? platform, bool manage, CancellationToken cancellationToken)
+        => PostAsync("v1/auth/link", new LinkStartRequest { Client = client, Platform = platform, Manage = manage ? true : null }, ProtocolJsonContext.Default.LinkStartRequest, ProtocolJsonContext.Default.LinkStartResponse, cancellationToken);
 
     /// <summary>
     /// Asks whether a link was approved. The answer is "pending", or "approved" with the API key -

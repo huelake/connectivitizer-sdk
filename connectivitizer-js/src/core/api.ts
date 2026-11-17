@@ -59,6 +59,10 @@ export interface LinkTokenResponse {
   workspaceName?: string;
   credentialId?: string;
   client?: string;
+  /** Whether the key may manage the workspace. */
+  manage?: boolean;
+  /** When the key stops working, if it does (ISO 8601). */
+  expiresAt?: string | null;
 }
 
 /** A device an application may open sessions to. */
@@ -129,8 +133,8 @@ export class PlatformApi {
   }
 
   /** An app asks to be linked to somebody's account. Nothing is granted until that person approves in the web app. */
-  startLink(client: string, platformName?: string): Promise<LinkStartResponse> {
-    return this.post<LinkStartResponse>('v1/auth/link', { client, platform: platformName });
+  startLink(client: string, platformName?: string, manage?: boolean): Promise<LinkStartResponse> {
+    return this.post<LinkStartResponse>('v1/auth/link', { client, platform: platformName, manage: manage ? true : undefined });
   }
 
   /** Whether a link was approved: "pending", or "approved" with the API key - once. Refused and expired links reject. */

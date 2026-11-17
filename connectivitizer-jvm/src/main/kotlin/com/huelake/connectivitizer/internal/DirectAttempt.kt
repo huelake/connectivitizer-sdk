@@ -77,6 +77,8 @@ internal class DirectAttempt(
     private val stunServers: List<String>,
     private val peerReflexive: Boolean,
     private val scope: CoroutineScope,
+    /** Receives one line per step of the attempt (addresses announced, first probe, the count at the end). */
+    private val log: ((String) -> Unit)? = null,
 ) {
     // Both endpoints hold the same grant, so both derive the same tag and KCP conversation id.
     private val digest = Bytes.sha256(grantToken.toByteArray(Charsets.UTF_8))
@@ -108,6 +110,11 @@ internal class DirectAttempt(
     private var hasStunServers = false
     private var handedOver = false
     private var closed = false
+    private var probesSent = 0L
+    private var probesReceived = 0L
+    private var answersReceived = 0L
+    private var foreignDatagrams = 0L
+    private val started = System.nanoTime()
 
     /** Discovers this endpoint's addresses and returns the candidate list to send to the peer. */
     suspend fun gather(): ByteArray {
@@ -115,6 +122,7 @@ internal class DirectAttempt(
         socket = udp
         udp.onMessage = ::onDatagram
         val mapped = discover()
+        log?.invoke("UDP socket on port ${udp.port}, IPv6 ${if (udp.ipv6) "yes" else "no"}; STUN: ${if (mapped != null) "$mapped (${if (stunSymmetric) "symmetric NAT" else "cone"})" else "no answer"}")
         val candidates = ArrayList<String>()
         var ipv4 = 0
         var ipv6 = 0
@@ -132,6 +140,7 @@ internal class DirectAttempt(
         val nat = if (!stunReachable) "unknown" else if (stunSymmetric) "symmetric" else "cone"
         val blob = Json.write(mapOf("sid" to sessionId, "role" to role, "udp" to candidates, "nat" to nat)).toByteArray(Charsets.UTF_8)
         localCandidatesHash = Bytes.hex(Bytes.sha256(blob))
+        log?.invoke("announcing ${join(candidates)}")
         return blob
     }
 
@@ -150,6 +159,11 @@ internal class DirectAttempt(
         }
         remoteCandidates = parsed
         remoteKnown.complete(Unit)
+        if (log != null) {
+            log.invoke("peer announces ${join(udp.filterIsInstance<String>())}; NAT $remoteNat; after ${elapsed()} ms")
+            // Asking the system for a source address may block, so that line is written from a coroutine.
+            scope.launch { log.invoke("probing them from: ${join(parsed.map { "${it.host} <- ${platform.sourceAddress(it.host) ?: "no route"}" })}") }
+        }
         return true
     }
 
@@ -221,6 +235,20 @@ internal class DirectAttempt(
         else -> DirectFailureReasons.PROBE_TIMEOUT
     }
 
+    /** What this side of the attempt sent and saw, for the log when no path was found. */
+    fun summary(): String {
+        val failed = socket?.sendFailures ?: 0
+        val failures = if (failed == 0L) "" else " ($failed not sent by the system, first ${socket?.firstSendFailure})"
+        val foreign = if (foreignDatagrams == 0L) "" else ", $foreignDatagrams other datagrams"
+        return "after ${elapsed()} ms: sent $probesSent probes$failures to ${join(probeTargets().map { it.toString() })}; received $probesReceived probes and $answersReceived answers$foreign"
+    }
+
+    private fun elapsed() = (System.nanoTime() - started) / 1_000_000
+
+    private fun join(items: List<String>) = if (items.isEmpty()) "(none)" else items.joinToString(", ")
+
+    private fun known(address: UdpAddress) = if (address in remoteCandidates) "announced" else if (address in learned) "learned" else "not announced"
+
     /** Gives up the attempt. A path that was handed to a session is not affected. */
     fun close() {
         if (closed) return
@@ -274,18 +302,22 @@ internal class DirectAttempt(
             for ((id, answer) in stun) if (answer[0] == null) answer[0] = Stun.readSuccess(data, id)
             return
         }
-        if (kind == DatagramType.PROBE || kind == DatagramType.PROBE_ACK) onProbe(data, host, port)
+        if (kind == DatagramType.PROBE || kind == DatagramType.PROBE_ACK) onProbe(data, host, port) else foreignDatagrams++
     }
 
     private fun onProbe(data: ByteArray, rawHost: String, port: Int) {
         val udp = socket ?: return
-        if (data.size != PROBE_SIZE || !MessageDigest.isEqual(data.copyOfRange(1, 9), tag)) return // not for this session
+        if (data.size != PROBE_SIZE || !MessageDigest.isEqual(data.copyOfRange(1, 9), tag)) {
+            foreignDatagrams++
+            return // not for this session
+        }
         val host = Addresses.normalizeHost(rawHost) ?: rawHost
         val from = UdpAddress(host, port)
         learn(from)
         val announced = from in remoteCandidates
         val flags = data[9].toInt()
         if ((data[0].toInt() and 0xff) == DatagramType.PROBE) {
+            if (probesReceived++ == 0L) log?.invoke("first probe from $from (${known(from)}) after ${elapsed()} ms")
             if (flags == FLAG_SELECT) {
                 // Only the initiator selects, and only an address from its own announced list (or, where the
                 // session allows it, one learned from its probes) is accepted.
@@ -297,6 +329,7 @@ internal class DirectAttempt(
                     val kcpPath = KcpPath(udp, host, port, conversation, scope)
                     kcpPath.onProbe = ::onProbe
                     path = kcpPath
+                    log?.invoke("the peer selected $from after ${elapsed()} ms")
                     selectedByPeer.complete(kcpPath)
                 } else if (selected != from) {
                     return
@@ -305,6 +338,7 @@ internal class DirectAttempt(
             udp.send(byteArrayOf(DatagramType.PROBE_ACK.toByte()) + data.copyOfRange(1, data.size), host, port)
             return
         }
+        if (answersReceived++ == 0L) log?.invoke("first answer from $from (${known(from)}) after ${elapsed()} ms")
         if (role == Roles.INITIATOR && (announced || from in learned)) {
             if (flags == FLAG_PROBE) {
                 (if (announced) validated else validatedLearned).complete(from)
@@ -317,7 +351,10 @@ internal class DirectAttempt(
     private suspend fun probeLoop(flags: Int, targets: () -> List<UdpAddress>, done: () -> Boolean) {
         while (!done() && !closed) {
             val probe = byteArrayOf(DatagramType.PROBE.toByte()) + tag + byteArrayOf(flags.toByte()) + platform.randomBytes(8)
-            for (target in targets()) socket?.send(probe, target.host, target.port)
+            for (target in targets()) {
+                socket?.send(probe, target.host, target.port)
+                probesSent++
+            }
             delay(PROBE_INTERVAL)
         }
     }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "huelake-connectivitizer"
-version = "1.0.50"
+version = "1.0.59"
 description = "Connectivitizer SDK for Python: reach services on devices behind NAT, end-to-end encrypted, relayed or peer to peer; and run a device."
 readme = "README.md"
 license = "MIT"

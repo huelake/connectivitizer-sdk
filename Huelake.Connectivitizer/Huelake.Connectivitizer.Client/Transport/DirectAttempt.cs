@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -55,6 +56,9 @@ internal sealed record DirectAttemptOptions
     /// Only for sessions whose end-to-end handshake authenticates the peer; see <see cref="PeerReflexiveFor"/>.
     /// </summary>
     public bool PeerReflexive { get; init; }
+
+    /// <summary>Receives one line per step of the attempt (addresses announced, first probe, the count at the end).</summary>
+    public Action<string>? Log { get; init; }
 
     /// <summary>Test hook: changes the UDP candidates before they are announced.</summary>
     internal Func<IReadOnlyList<string>, IReadOnlyList<string>>? AnnounceFilter { get; init; }
@@ -123,6 +127,13 @@ internal sealed class DirectAttempt : IAsyncDisposable
     private KcpPath? _path;
     private bool _portHandedOver;
     private int _chosen;
+    private long _probesSent;
+    private long _probesReceived;
+    private long _answersReceived;
+    private long _foreignDatagrams;
+    private int _firstProbeSeen;
+    private int _firstAnswerSeen;
+    private readonly long _started = Stopwatch.GetTimestamp();
 
     public DirectAttempt(string role, string sessionId, string grantToken, DirectAttemptOptions options)
     {
@@ -164,6 +175,8 @@ internal sealed class DirectAttempt : IAsyncDisposable
         if (_options.Udp)
         {
             _stun = await StunClient.DiscoverAsync(_port, _options.StunServers, StunTimeout, cancellationToken).ConfigureAwait(false);
+            Log($"UDP socket on port {_port.LocalEndPoint.Port}, IPv6 {(_port.SupportsIPv6 ? "yes" : "no")}; STUN: "
+                + (_stun.Mapped is { } seen ? $"{UdpPort.Plain(seen)} ({(_stun.Symmetric ? "symmetric NAT" : "cone")})" : "no answer"));
             foreach (IPAddress local in LocalAddresses(ipv6: _port.SupportsIPv6))
             {
                 udp.Add(new IPEndPoint(local, _port.LocalEndPoint.Port).ToString());
@@ -208,6 +221,7 @@ internal sealed class DirectAttempt : IAsyncDisposable
             Tcp = tcp is { Count: > 0 } ? [.. tcp] : null,
         }, TransportJsonContext.Default.CandidateList);
         LocalCandidatesHash = Convert.ToHexStringLower(SHA256.HashData(blob));
+        Log($"announcing {Join(udp)}{(tcp is { Count: > 0 } ? $"; TCP {Join(tcp)}" : "")}");
         return blob;
     }
 
@@ -232,6 +246,11 @@ internal sealed class DirectAttempt : IAsyncDisposable
         _remoteNat = list.Nat;
         _remoteCandidates = _options.Udp ? Parse(list.Udp, ipv6: _port.SupportsIPv6) : [];
         _remoteKnown.TrySetResult();
+        if (_options.Log is not null)
+        {
+            Log($"peer announces {Join(list.Udp)}; NAT {list.Nat}; after {Elapsed()} ms");
+            Log($"probing them from: {Join(_remoteCandidates.Select(target => $"{target.Address} <- {SourceFor(target)?.ToString() ?? "no route"}"))}");
+        }
         _tcp?.Dial(Parse(list.Tcp ?? [], ipv6: false));
         return true;
     }
@@ -424,6 +443,7 @@ internal sealed class DirectAttempt : IAsyncDisposable
             foreach (IPEndPoint target in targets())
             {
                 await _port.SendAsync(probe, target, cancellationToken).ConfigureAwait(false);
+                Interlocked.Increment(ref _probesSent);
             }
         }
         while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false));
@@ -434,11 +454,28 @@ internal sealed class DirectAttempt : IAsyncDisposable
         ReadOnlySpan<byte> span = datagram.Span;
         if (span.Length != ProbeSize || !span.Slice(1, 8).SequenceEqual(_tag) || span[0] is not (DatagramType.Probe or DatagramType.ProbeAck))
         {
+            Interlocked.Increment(ref _foreignDatagrams);
             return default; // not for this session
         }
 
         Learn(remote);
         byte flags = span[9];
+        if (span[0] == DatagramType.Probe)
+        {
+            Interlocked.Increment(ref _probesReceived);
+            if (Interlocked.Exchange(ref _firstProbeSeen, 1) == 0)
+            {
+                Log($"first probe from {remote} ({Known(remote)}) after {Elapsed()} ms");
+            }
+        }
+        else
+        {
+            Interlocked.Increment(ref _answersReceived);
+            if (Interlocked.Exchange(ref _firstAnswerSeen, 1) == 0)
+            {
+                Log($"first answer from {remote} ({Known(remote)}) after {Elapsed()} ms");
+            }
+        }
         if (span[0] == DatagramType.Probe)
         {
             if (flags == FlagSelect)
@@ -458,6 +495,7 @@ internal sealed class DirectAttempt : IAsyncDisposable
                     _selected = remote;
                     _portHandedOver = true;
                     _path = new KcpPath(_port, remote, _conversation, ownsPort: true) { ProbeHandler = OnProbeAsync };
+                    Log($"the peer selected {remote} after {Elapsed()} ms");
                     _selectedByPeer.TrySetResult(remote);
                 }
                 else if (!remote.Equals(_selected))
@@ -486,11 +524,47 @@ internal sealed class DirectAttempt : IAsyncDisposable
         return default;
     }
 
+    /// <summary>What this side of the attempt sent and saw, for the log when no path was found.</summary>
+    public string Summary()
+    {
+        string failures = _port.SendFailures == 0 ? "" : $" ({_port.SendFailures} not sent by the system, first {_port.FirstSendFailure})";
+        string foreign = _foreignDatagrams == 0 ? "" : $", {Interlocked.Read(ref _foreignDatagrams)} other datagrams";
+        return $"after {Elapsed()} ms: sent {Interlocked.Read(ref _probesSent)} probes{failures} to {Join(ProbeTargets().Select(target => target.ToString()))}; "
+            + $"received {Interlocked.Read(ref _probesReceived)} probes and {Interlocked.Read(ref _answersReceived)} answers{foreign}";
+    }
+
+    private void Log(string message) => _options.Log?.Invoke(message);
+
+    private long Elapsed() => (long)Stopwatch.GetElapsedTime(_started).TotalMilliseconds;
+
+    private static string Join(IEnumerable<string> items) => string.Join(", ", items.DefaultIfEmpty("(none)"));
+
+    private string Known(IPEndPoint remote) => _remoteCandidates.Contains(remote) ? "announced" : IsLearned(remote) ? "learned" : "not announced";
+
+    /// <summary>
+    /// The local address the system sends from to reach a target, by its routing table. Asked with a
+    /// socket that is only given the destination: nothing is sent. Null without a route.
+    /// </summary>
+    private static IPAddress? SourceFor(IPEndPoint target)
+    {
+        try
+        {
+            using var probe = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            probe.Connect(target);
+            return (probe.LocalEndPoint as IPEndPoint)?.Address;
+        }
+        catch (Exception ex) when (ex is SocketException or NotSupportedException or ObjectDisposedException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>This machine's IPv4 addresses and, if asked for, its global IPv6 addresses (at most a few of each).</summary>
     private IEnumerable<IPAddress> LocalAddresses(bool ipv6)
     {
         var found = new List<IPAddress>();
         var global6 = new List<IPAddress>();
+        var deprecated6 = new List<IPAddress>();
         try
         {
             foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
@@ -512,7 +586,15 @@ internal sealed class DirectAttempt : IAsyncDisposable
                     }
                     else if (ipv6 && IsGlobalIPv6(address.Address) && !global6.Contains(address.Address))
                     {
-                        global6.Add(address.Address);
+                        // An address the system no longer sends from (its prefix was replaced) goes last.
+                        if (IsDeprecated(address))
+                        {
+                            deprecated6.Add(address.Address);
+                        }
+                        else
+                        {
+                            global6.Add(address.Address);
+                        }
                     }
                 }
             }
@@ -520,7 +602,54 @@ internal sealed class DirectAttempt : IAsyncDisposable
         catch (NetworkInformationException)
         {
         }
-        return found.Take(6).Concat(global6.Take(MaxIPv6Addresses));
+        return found.Take(6).Concat(OrderIPv6(ipv6 ? OutgoingIPv6Address() : null, global6, deprecated6).Take(MaxIPv6Addresses));
+    }
+
+    /// <summary>
+    /// The IPv6 addresses to announce, the ones that matter first, because only a few are announced. A machine
+    /// often has several (a stable one and temporary ones per prefix, and for a while those of a prefix its
+    /// router has replaced), but it sends from one of them, and the firewalls on the way let the peer's
+    /// probes in only for that one: a probe to another address of this machine meets no opening, and this
+    /// machine's own probes come from an address the peer was never told. So: the address this machine sends
+    /// from, then its other usable ones, then deprecated ones.
+    /// </summary>
+    internal static IEnumerable<IPAddress> OrderIPv6(IPAddress? outgoing, IReadOnlyList<IPAddress> usable, IReadOnlyList<IPAddress> deprecated)
+    {
+        IEnumerable<IPAddress> first = outgoing is not null && IsGlobalIPv6(outgoing) ? [outgoing] : [];
+        return first.Concat(usable).Concat(deprecated).Distinct();
+    }
+
+    /// <summary>
+    /// The address this machine sends from to the IPv6 internet, as its routing and address selection decide
+    /// (RFC 6724; on most systems a temporary address). Asked with a UDP socket that is only given a
+    /// destination: nothing is sent. Null without IPv6 or without a route.
+    /// </summary>
+    private static IPAddress? OutgoingIPv6Address()
+    {
+        try
+        {
+            using var probe = new Socket(AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp);
+            // Any global address has the same route; this one is reserved for documentation (RFC 3849).
+            probe.Connect(new IPEndPoint(IPAddress.Parse("2001:db8::1"), 9));
+            return (probe.LocalEndPoint as IPEndPoint)?.Address;
+        }
+        catch (Exception ex) when (ex is SocketException or NotSupportedException or ObjectDisposedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Whether the system has stopped using an address for new connections. Systems that do not say are taken at their word: usable.</summary>
+    private static bool IsDeprecated(UnicastIPAddressInformation address)
+    {
+        try
+        {
+            return OperatingSystem.IsWindows() && address.DuplicateAddressDetectionState == DuplicateAddressDetectionState.Deprecated;
+        }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or NotImplementedException)
+        {
+            return false;
+        }
     }
 
     /// <summary>A global unicast IPv6 address (2000::/3): one a peer elsewhere on the internet can send to, without NAT in between.</summary>

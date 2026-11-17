@@ -6,7 +6,7 @@ import { Capabilities, ConnectionModes, E2eMethods, Roles, type SessionGrant, e2
 import { type SharedKey, parseSharedKey } from './noise.js';
 import type { Platform } from './platform.js';
 import { RelayPath } from './relayPath.js';
-import { type SecureLayer, TunnelSession } from './session.js';
+import { type ConnectionInfo, type SecureLayer, TunnelSession } from './session.js';
 import { type SignalConnectGrant, type SignalEnvelope, SignalingClient } from './signaling.js';
 import { Deferred, delay, settledWithin, withTimeout } from './streams.js';
 
@@ -37,6 +37,13 @@ export interface ClientOptions {
   /** STUN servers (`host:port`) to learn the public address from, instead of the ones the platform announces. */
   stunServers?: readonly string[];
 
+  /**
+   * Diagnostics: one line per step of a session (grant, the peer-to-peer attempt, the path taken), to find out
+   * why a session went through the relay. The lines contain this endpoint's and the peer's network addresses,
+   * never keys or content.
+   */
+  log?: (line: string) => void;
+
   /** Certificate layer of the runtime, where there is one (Node.js). Set by the platform adapter. */
   certificates?: CertificateSupport;
 
@@ -63,6 +70,22 @@ export interface CertificateSupport {
   hasPinFor(device: string): boolean;
   /** The layer for one session, given what the platform said about the peer. */
   layerFor(device: string, peer: { id: string; name?: string }, grant: SessionGrant): SecureLayer;
+}
+
+/**
+ * @internal What a device contributes when it opens sessions itself: its own connection to the platform. The
+ * client then logs in nowhere, and the connection stays the device's to close.
+ */
+export interface DeviceSignaling {
+  /** The device's signaling connection; waits until the device is connected. */
+  connected(): Promise<SignalingClient>;
+  /** The connection as it is at this moment, or null while the device is not connected. */
+  current(): SignalingClient | null;
+  /** The time by the control plane's clock, as the device keeps it. */
+  nowSeconds(): number;
+  /** Called when the opening of a session is over, whether it succeeded or not. */
+  opened(sessionId: string): void;
+  log(message: string): void;
 }
 
 const ANSWER_TIMEOUT_MS = 15_000;
@@ -96,12 +119,17 @@ export class ConnectivitizerClient {
   private readonly answers = new Map<string, Deferred<{ accept: boolean; error?: string }>>();
   private readonly candidates = new Map<string, Deferred<Uint8Array>>();
   private readonly sessions = new Map<string, TunnelSession>();
+  /** The sessions this client asked for, from the grant until they have ended. */
+  private readonly own = new Set<string>();
+  /** Connect requests the platform has not answered yet. */
+  private requesting = 0;
   private signaling: SignalingClient | null = null;
   private connecting: Promise<SignalingClient> | null = null;
   private clockOffset = 0;
   private closed = false;
 
-  constructor(private readonly options: ClientOptions) {
+  /** @param device @internal Set by a device that opens sessions over its own signaling connection. */
+  constructor(private readonly options: ClientOptions, private readonly device?: DeviceSignaling) {
     this.keys = toKeys(options.sharedKey);
     if (this.keys.length === 0 && !options.certificates) {
       throw new ConnectivitizerError(ErrorCodes.InvalidRequest, 'An application needs a shared key (or, in Node.js, a certificate identity): without either there is nothing to encrypt end to end with.');
@@ -112,6 +140,9 @@ export class ConnectivitizerClient {
 
   /** The current time by the control plane's clock, which is what grants are judged against. */
   private nowSeconds(): number {
+    if (this.device) {
+      return this.device.nowSeconds();
+    }
     return Math.floor(Date.now() / 1000) + this.clockOffset;
   }
 
@@ -126,12 +157,39 @@ export class ConnectivitizerClient {
     const sharedKey = this.selectSharedKey(device);
     const signaling = await this.ensureSignaling();
 
-    const reply = await signaling.request('connect.request', { device, services, e2e: this.acceptableE2e(device, sharedKey) }, ANSWER_TIMEOUT_MS);
-    const granted = reply.d as unknown as SignalConnectGrant;
-    if (reply.t !== 'connect.grant' || !granted?.sid || !granted.grant || !granted.peer) {
-      throw new ConnectivitizerError(ErrorCodes.InvalidRequest, 'The control plane sent an unexpected answer.');
+    let granted: SignalConnectGrant;
+    this.requesting++;
+    try {
+      const reply = await signaling.request('connect.request', { device, services, e2e: this.acceptableE2e(device, sharedKey) }, ANSWER_TIMEOUT_MS);
+      granted = reply.d as unknown as SignalConnectGrant;
+      if (reply.t !== 'connect.grant' || !granted?.sid || !granted.grant || !granted.peer) {
+        throw new ConnectivitizerError(ErrorCodes.InvalidRequest, 'The control plane sent an unexpected answer.');
+      }
+      this.own.add(granted.sid);
+    } finally {
+      if (--this.requesting === 0 && this.device) {
+        // On a device's connection, candidates of sessions opened to it pass by as well. Those kept while
+        // the session id of this request was unknown are dropped.
+        for (const other of [...this.candidates.keys()]) {
+          if (!this.own.has(other)) {
+            this.candidates.delete(other);
+          }
+        }
+      }
     }
     const sessionId = granted.sid;
+    const log = (text: string): void => {
+      try {
+        if (!this.device) {
+          this.options.log?.(`${device} session ${sessionId.slice(0, 8)}: ${text}`);
+        } else if (text.startsWith('direct: ')) {
+          // A device's log carries the lines of the direct attempt, in the form of its other session lines.
+          this.device.log(`session ${sessionId}: ${text}`);
+        }
+      } catch {
+        // Diagnostics must never break a session.
+      }
+    };
 
     let attempt: DirectAttempt | null = null;
     try {
@@ -183,11 +241,16 @@ export class ConnectivitizerClient {
       let directFailure: string | undefined = directPermitted ? undefined
         : !canDirect || !peerSupportsDirect ? DirectFailureReasons.PeerNoDirectSupport
         : DirectFailureReasons.PolicyRelayOnly;
+      const stunServers = this.options.stunServers ?? signaling.welcome.stunServers ?? [];
+      log(`granted ${grant.modes.join(', ')} (e2e ${method}); this app: UDP ${this.options.platform.udp ? 'yes' : 'no'}${this.options.disableDirect ? ', direct disabled' : ''}; `
+        + `device: ${peerSupportsDirect ? 'can go direct' : 'cannot go direct'} (${peerCaps.join(', ') || 'no capabilities'}); STUN servers ${stunServers.join(', ') || 'none'}`
+        + (directPermitted ? '' : `; no direct attempt (${directFailure})`));
 
       let session: TunnelSession | null = null;
       if (directPermitted) {
-        attempt = new DirectAttempt(this.options.platform, Roles.Initiator, sessionId, granted.grant, this.options.stunServers ?? signaling.welcome.stunServers ?? [], {
+        attempt = new DirectAttempt(this.options.platform, Roles.Initiator, sessionId, granted.grant, stunServers, {
           peerReflexive: peerReflexiveFor(e2eMethodOf(grant)),
+          log,
         });
         const current = attempt;
         void this.waiter(this.candidates, sessionId).promise.then((blob) => current.setRemoteCandidates(blob), () => undefined);
@@ -225,16 +288,21 @@ export class ConnectivitizerClient {
       }
 
       this.sessions.set(sessionId, session);
+      this.deviceLog(`session ${sessionId} opened to ${peerLabel} (${session.info.mode}, ${session.info.trust}${session.info.peerAddress ? `, peer at ${session.info.peerAddress}` : ''})`);
+      log(`established: ${session.info.mode} over ${session.info.transport}${session.info.directFailureReason ? ` (direct failed: ${session.info.directFailureReason})` : ''}`);
       this.report({ sid: sessionId, state: 'established', mode: session.info.mode, trust: session.info.trust, directFailureReason: session.info.directFailureReason, transport: session.info.transport });
       void this.watch(session);
       void this.renewLeases(session);
       return session;
     } catch (error) {
+      log(`failed: ${codeOf(error)} ${error instanceof Error ? error.message : String(error)}`);
+      this.own.delete(sessionId);
       this.report({ sid: sessionId, state: 'failed', error: codeOf(error) });
       throw error;
     } finally {
       this.candidates.delete(sessionId);
       attempt?.close();
+      this.device?.opened(sessionId);
     }
   }
 
@@ -260,9 +328,28 @@ export class ConnectivitizerClient {
     }
     this.closed = true;
     await Promise.all([...this.sessions.values()].map((session) => session.close()));
+    if (this.device) {
+      // The connection is the device's.
+      return;
+    }
     // Give the end-of-session reports a moment to leave before the channel closes.
     await delay(50);
     this.signaling?.close();
+  }
+
+  /** @internal The sessions this client opened that are still running. */
+  get openSessions(): ConnectionInfo[] {
+    return [...this.sessions.values()].map((session) => session.info);
+  }
+
+  /** @internal True for a session this client asked for, from the moment the platform granted it until it has ended. */
+  owns(sessionId: string): boolean {
+    return this.own.has(sessionId);
+  }
+
+  /** @internal Ends every session this client opened. */
+  async endAll(reason: string): Promise<void> {
+    await Promise.all([...this.sessions.values()].map((session) => session.end(reason)));
   }
 
   /** The shared key for a device: the one named like it, else the only one, else the one named "default". */
@@ -297,6 +384,9 @@ export class ConnectivitizerClient {
   }
 
   private ensureSignaling(): Promise<SignalingClient> {
+    if (this.device) {
+      return this.device.connected();
+    }
     if (this.signaling?.isOpen) {
       return Promise.resolve(this.signaling);
     }
@@ -348,7 +438,8 @@ export class ConnectivitizerClient {
     return signaling;
   }
 
-  private onSignal(message: SignalEnvelope): void {
+  /** @internal Takes a message from the signaling connection. A device passes on what concerns the sessions it opened. */
+  onSignal(message: SignalEnvelope): void {
     const data = message.d ?? {};
     const sessionId = typeof data.sid === 'string' ? data.sid : null;
     switch (message.t) {
@@ -358,6 +449,10 @@ export class ConnectivitizerClient {
         }
         break;
       case 'path.candidates':
+        if (this.device && sessionId && !this.own.has(sessionId) && this.requesting === 0) {
+          // The candidates of a session that was opened to the device.
+          break;
+        }
         if (sessionId && typeof data.blob === 'string') {
           try {
             this.waiter(this.candidates, sessionId).resolve(base64Decode(data.blob));
@@ -385,6 +480,8 @@ export class ConnectivitizerClient {
   private async watch(session: TunnelSession): Promise<void> {
     const reason = await session.completion;
     this.sessions.delete(session.info.sessionId);
+    this.own.delete(session.info.sessionId);
+    this.deviceLog(`session ${session.info.sessionId} ended (${reason})`);
     this.report({ sid: session.info.sessionId, state: 'ended', error: reason, bytesSent: session.bytesSent, bytesReceived: session.bytesReceived });
   }
 
@@ -419,10 +516,19 @@ export class ConnectivitizerClient {
     }
   }
 
+  private deviceLog(message: string): void {
+    try {
+      this.device?.log(message);
+    } catch {
+      // Diagnostics must never break a session.
+    }
+  }
+
   private report(update: Record<string, unknown>): void {
     try {
-      if (this.signaling?.isOpen) {
-        this.signaling.send('session.update', update);
+      const signaling = this.device ? this.device.current() : this.signaling;
+      if (signaling?.isOpen) {
+        signaling.send('session.update', update);
       }
     } catch {
       // Reporting is best effort; the session itself is unaffected.

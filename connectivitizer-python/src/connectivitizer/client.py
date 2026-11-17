@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Union
 
 from .api import GrantVerifier, PlatformApi, ReachableDevice, TokenResponse
 from .direct.attempt import DirectAttempt, DirectFailureReasons, peer_reflexive_for
@@ -14,7 +14,7 @@ from .grants import Capabilities, ConnectionModes, E2eMethods, Grant, Roles, e2e
 from .noise import SharedKey, parse_shared_key
 from .platform import Platform
 from .relay_path import RelayPath
-from .session import SessionParameters, TunnelSession
+from .session import ConnectionInfo, SessionParameters, TunnelSession
 from .signaling import Envelope, SignalingClient
 from .streams import fail, new_future, settle, settled_within, spawn, with_timeout
 
@@ -60,8 +60,17 @@ class ConnectivitizerClient:
         disable_direct: bool = False,
         stun_servers: Optional[Sequence[str]] = None,
         platform: Optional[Platform] = None,
+        _signaling: Optional[Callable[[], Awaitable[SignalingClient]]] = None,
+        _opened: Optional[Callable[[str], None]] = None,
+        _log: Optional[Callable[[str], None]] = None,
+        _now_seconds: Optional[Callable[[], int]] = None,
     ) -> None:
-        if (api_key is None) == (get_token is None):
+        # The underscore parameters are set by a device that opens sessions itself (ConnectivitizerAgent):
+        # ``_signaling`` returns the device's own signaling connection once it is connected, and the client
+        # then logs in nowhere and does not own that connection; ``_opened`` is called with the session id
+        # when the opening of a session is over, whether it succeeded or not; ``_log`` receives one line per
+        # noteworthy event; ``_now_seconds`` is the device's reading of the control plane's clock.
+        if _signaling is None and (api_key is None) == (get_token is None):
             raise ConnectivitizerError(ErrorCodes.INVALID_REQUEST, "An application authenticates with api_key or with get_token.")
         self._keys = to_keys(shared_key)
         if not self._keys:
@@ -78,6 +87,14 @@ class ConnectivitizerClient:
         self._sessions: Dict[str, TunnelSession] = {}
         self._signaling: Optional[SignalingClient] = None
         self._connecting: Optional[asyncio.Future] = None
+        self._attached = _signaling
+        self._opened = _opened
+        self._log_sink = _log
+        self._device_clock = _now_seconds
+        self._own: Set[str] = set()
+        """The sessions this client asked for, from the moment the platform granted them until they have ended."""
+        self._requesting = 0
+        """How many connection requests wait for the platform's reply; their session ids are unknown until then."""
         self._clock_offset = 0
         self._closed = False
 
@@ -89,6 +106,8 @@ class ConnectivitizerClient:
 
     def _now_seconds(self) -> int:
         """The current time by the control plane's clock, which is what grants are judged against."""
+        if self._device_clock is not None:
+            return self._device_clock()
         return int(time.time()) + self._clock_offset
 
     async def connect(self, device: str, services: List[str]) -> TunnelSession:
@@ -101,13 +120,23 @@ class ConnectivitizerClient:
             raise ConnectivitizerError(ErrorCodes.E2E_NO_COMMON_METHOD, f"No shared key is configured for '{device}' (name one after the device, or 'default').")
         signaling = await self._ensure_signaling()
 
-        reply = await signaling.request("connect.request", {"device": device, "services": services, "e2e": [E2eMethods.SHARED_KEY]}, ANSWER_TIMEOUT)
-        granted = reply.get("d") or {}
-        if reply.get("t") != "connect.grant" or not granted.get("sid") or not granted.get("grant") or not isinstance(granted.get("peer"), dict):
-            raise ConnectivitizerError(ErrorCodes.INVALID_REQUEST, "The control plane sent an unexpected answer.")
-        session_id: str = granted["sid"]
-        grant_token: str = granted["grant"]
-        peer: Dict[str, Any] = granted["peer"]
+        self._requesting += 1
+        try:
+            reply = await signaling.request("connect.request", {"device": device, "services": services, "e2e": [E2eMethods.SHARED_KEY]}, ANSWER_TIMEOUT)
+            granted = reply.get("d") or {}
+            if reply.get("t") != "connect.grant" or not granted.get("sid") or not granted.get("grant") or not isinstance(granted.get("peer"), dict):
+                raise ConnectivitizerError(ErrorCodes.INVALID_REQUEST, "The control plane sent an unexpected answer.")
+            session_id: str = granted["sid"]
+            grant_token: str = granted["grant"]
+            peer: Dict[str, Any] = granted["peer"]
+            self._own.add(session_id)
+        finally:
+            self._requesting -= 1
+            if self._requesting == 0 and self._attached is not None:
+                # On a device's connection, candidates of sessions opened to it pass by as well. Those kept while
+                # the session id of this request was unknown are dropped.
+                for other in [known for known in self._candidates if known not in self._own]:
+                    del self._candidates[other]
 
         attempt: Optional[DirectAttempt] = None
         try:
@@ -158,7 +187,15 @@ class ConnectivitizerClient:
             session: Optional[TunnelSession] = None
             if direct_permitted:
                 stun = self._stun_servers if self._stun_servers is not None else (signaling.welcome.get("stunServers") or [])
-                attempt = DirectAttempt(self._platform, Roles.INITIATOR, session_id, grant_token, stun, peer_reflexive=peer_reflexive_for(method))
+                attempt = DirectAttempt(
+                    self._platform,
+                    Roles.INITIATOR,
+                    session_id,
+                    grant_token,
+                    stun,
+                    peer_reflexive=peer_reflexive_for(method),
+                    log=(lambda message: self._log(f"session {session_id}: direct: {message}")) if self._log_sink is not None else None,
+                )
                 current = attempt
                 spawn(self._apply_candidates(session_id, current))
                 blob = await attempt.gather()
@@ -191,11 +228,14 @@ class ConnectivitizerClient:
 
             self._sessions[session_id] = session
             info = session.info
+            where = f", peer at {info.peer_address}" if info.peer_address else ""
+            self._log(f"session {session_id} opened to {peer_label} ({info.mode}, {info.trust}{where})")
             self._report({"sid": session_id, "state": "established", "mode": info.mode, "trust": info.trust, "directFailureReason": info.direct_failure_reason, "transport": info.transport})
             spawn(self._watch(session))
             spawn(self._renew_leases(session))
             return session
         except BaseException as error:
+            self._own.discard(session_id)
             self._report({"sid": session_id, "state": "failed", "error": code_of(error)})
             raise
         finally:
@@ -204,6 +244,8 @@ class ConnectivitizerClient:
                 fail(waiting, ConnectivitizerError(ErrorCodes.SESSION_CLOSED, "The path negotiation is over."))
             if attempt is not None:
                 attempt.close()
+            if self._opened is not None:
+                self._opened(session_id)
 
     async def list_devices(self) -> List[ReachableDevice]:
         """The devices this application may open sessions to: names, whether they are online, and the
@@ -219,8 +261,25 @@ class ConnectivitizerClient:
         await asyncio.gather(*(session.close() for session in list(self._sessions.values())), return_exceptions=True)
         # Give the end-of-session reports a moment to leave before the channel closes.
         await asyncio.sleep(0.05)
-        if self._signaling is not None:
+        if self._signaling is not None and self._attached is None:
             await self._signaling.close()
+
+    @property
+    def _open_sessions(self) -> List[ConnectionInfo]:
+        """The sessions this client opened that are still running."""
+        return [session.info for session in self._sessions.values()]
+
+    def _owns(self, session_id: str) -> bool:
+        """True for a session this client asked for, from the moment the platform granted it until it has ended."""
+        return session_id in self._own
+
+    async def _end_all(self, reason: str) -> None:
+        """Ends every session this client opened."""
+        await asyncio.gather(*(session.end(reason) for session in list(self._sessions.values())), return_exceptions=True)
+
+    def _log(self, message: str) -> None:
+        if self._log_sink is not None:
+            self._log_sink(message)
 
     def _select_shared_key(self, device: str) -> Optional[SharedKey]:
         lower = device.lower()
@@ -246,6 +305,11 @@ class ConnectivitizerClient:
         return await self._get_token()  # type: ignore[misc]
 
     async def _ensure_signaling(self) -> SignalingClient:
+        if self._attached is not None:
+            # The device's connection: the one that is open at this moment, also after the device reconnected.
+            current = await self._attached()
+            self._signaling = current
+            return current
         if self._signaling is not None and self._signaling.is_open:
             return self._signaling
         if self._connecting is None:
@@ -271,12 +335,15 @@ class ConnectivitizerClient:
         return signaling
 
     def _on_signal(self, message: Envelope) -> None:
+        """Takes a message from the signaling connection. A device passes on what concerns the sessions it opened."""
         data = message.get("d") or {}
         session_id = data.get("sid") if isinstance(data.get("sid"), str) else None
         kind = message.get("t")
         if kind == "connect.answer" and session_id:
             settle(self._waiter(self._answers, session_id), {"accept": data.get("accept") is True, "error": data.get("error") if isinstance(data.get("error"), str) else None})
         elif kind == "path.candidates" and session_id and isinstance(data.get("blob"), str):
+            if self._attached is not None and session_id not in self._own and self._requesting == 0:
+                return  # the candidates of a session opened to the device
             try:
                 settle(self._waiter(self._candidates, session_id), base64.b64decode(data["blob"], validate=True))
             except ValueError:
@@ -292,6 +359,8 @@ class ConnectivitizerClient:
         """Tells the control plane when and why the session ended, with this endpoint's own traffic count."""
         reason = await session.completion
         self._sessions.pop(session.info.session_id, None)
+        self._own.discard(session.info.session_id)
+        self._log(f"session {session.info.session_id} ended ({reason})")
         self._report({"sid": session.info.session_id, "state": "ended", "error": reason, "bytesSent": session.bytes_sent, "bytesReceived": session.bytes_received})
 
     async def _renew_leases(self, session: TunnelSession) -> None:

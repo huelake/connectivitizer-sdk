@@ -30,4 +30,30 @@ class JavaCallerTest {
             assertEquals(false, e.getCode().isEmpty());
         }
     }
+
+    @Test
+    void aDeviceOffersJavaTheCallsThatOpenSessions() throws InterruptedException {
+        ConnectivitizerAgent agent = ConnectivitizerAgent.builder("http://127.0.0.1:9").deviceKey("czd_x").name("here")
+                .sharedKey(SharedKey.generate()).build();
+        assertEquals(0, agent.getOutgoingSessions().size());
+        agent.stopBlocking();
+        try {
+            agent.connectBlocking("there", java.util.List.of("api"));
+            fail("a stopped device opens no session");
+        } catch (ConnectivitizerException e) {
+            assertEquals(ErrorCodes.SESSION_CLOSED, e.getCode());
+        }
+        try {
+            agent.listDevicesBlocking();
+            fail("a stopped device asks nothing");
+        } catch (ConnectivitizerException e) {
+            assertEquals(ErrorCodes.SESSION_CLOSED, e.getCode());
+        }
+        try {
+            agent.connectAsync("there", java.util.List.of("api")).get();
+            fail("a stopped device opens no session");
+        } catch (java.util.concurrent.ExecutionException e) {
+            assertEquals(ErrorCodes.SESSION_CLOSED, ((ConnectivitizerException) e.getCause()).getCode());
+        }
+    }
 }

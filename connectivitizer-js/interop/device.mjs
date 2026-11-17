@@ -10,8 +10,10 @@
 //   CZ_TARGET             host:port of the local application to expose as CZ_SERVICE (default api)
 //   CZ_DIRECT=none        never attempt a peer-to-peer connection
 //   CZ_LOOPBACK=true      offer loopback addresses (both endpoints on one machine)
+//   CZ_CALL               <device>/<service>: once connected, open a session to that device and GET /hello there
 //
-// It prints READY once the platform sees it, and its log after that.
+// It prints READY once the platform sees it, and its log after that. With CZ_CALL it also prints one line
+// CALLED <mode> <body>, or CALL_FAILED <code>, and keeps that session open until it stops.
 
 import { ConnectivitizerError, StateDirectory, agentOptionsFrom, createAgent } from '../dist/index.js';
 
@@ -56,7 +58,22 @@ process.stdin.on('data', () => void agent.stop());
 process.stdin.on('end', () => void agent.stop());
 
 const running = agent.run();
-agent.waitUntilConnected().then(() => console.log('READY'), () => undefined);
+agent.waitUntilConnected().then(async () => {
+  console.log('READY');
+  const call = process.env.CZ_CALL;
+  if (!call) {
+    return;
+  }
+  try {
+    const slash = call.lastIndexOf('/');
+    const service = call.substring(slash + 1);
+    const session = await agent.connect(call.substring(0, slash), [service]);
+    const hello = await session.fetch(service, '/hello');
+    console.log(`CALLED ${session.info.mode} ${await hello.text()}`);
+  } catch (error) {
+    console.log(`CALL_FAILED ${error instanceof ConnectivitizerError ? error.code : String(error?.message ?? error)}`);
+  }
+}, () => undefined);
 try {
   await running;
   process.exit(0);

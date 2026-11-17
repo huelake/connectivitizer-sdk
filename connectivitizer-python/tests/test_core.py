@@ -6,17 +6,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import os
 import random
 import unittest
 from typing import List, Optional, Tuple
 
 from connectivitizer.api import PlatformApi
+from connectivitizer.direct.attempt import DirectAttempt
 from connectivitizer.direct.kcp import Kcp
+from connectivitizer.direct.kcp_path import DatagramType
 from connectivitizer.errors import ConnectivitizerError, ErrorCodes
+from connectivitizer.grants import Roles
 from connectivitizer.http import http_request
 from connectivitizer.mux import INITIAL_WINDOW, MuxSession
 from connectivitizer.noise import MAX_PLAINTEXT, accept_shared_key, connect_shared_key, generate_shared_key, parse_shared_key, prologue
+from connectivitizer.platform import UdpSocket
 from connectivitizer.streams import ByteStream, StreamReader
 from connectivitizer.websocket import GUID, StreamWebSocket, parse_head
 
@@ -290,6 +295,65 @@ class KcpOverABadLink(unittest.IsolatedAsyncioTestCase):
         sender.send(b"x")
         sender.update(100)
         self.assertLess(Kcp(2, lambda _: None).input(packets[0]), 0)
+
+
+class _NoTransport:
+    """A datagram transport that sends nowhere."""
+
+    def sendto(self, data: bytes, address: tuple) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _OneNetwork:
+    """A machine with one IPv4 address and no IPv6."""
+
+    async def bind_udp(self) -> UdpSocket:
+        return UdpSocket(_NoTransport(), 40000, False)  # type: ignore[arg-type]
+
+    async def local_addresses(self) -> List[str]:
+        return ["192.0.2.10"]
+
+    def source_address(self, host: str) -> Optional[str]:
+        return None if ":" in host else "192.0.2.10"
+
+    def random_bytes(self, length: int) -> bytes:
+        return os.urandom(length)
+
+
+class DirectAttemptLog(unittest.IsolatedAsyncioTestCase):
+    async def test_each_step_and_the_count_at_the_end_are_logged(self) -> None:
+        lines: List[str] = []
+        attempt = DirectAttempt(_OneNetwork(), Roles.DEVICE, "s1", "grant", [], log=lines.append)  # type: ignore[arg-type]
+        await attempt.gather()
+        peer = {"sid": "s1", "role": Roles.INITIATOR, "udp": ["198.51.100.7:5000", "[2001:db8::7]:5000"], "nat": "cone"}
+        self.assertTrue(attempt.set_remote_candidates(json.dumps(peer).encode("utf-8")))
+        waiting = asyncio.ensure_future(attempt.wait_for_selection())
+        await asyncio.sleep(0.02)  # one round of probes
+
+        def probe(token: str) -> bytes:
+            return bytes([DatagramType.PROBE]) + hashlib.sha256(token.encode("utf-8")).digest()[:8] + bytes(9)
+
+        attempt._on_datagram(probe("grant"), "198.51.100.7", 5000)
+        attempt._on_datagram(probe("another grant"), "198.51.100.8", 5000)
+        summary = attempt.summary()
+        attempt.close()
+        with self.assertRaises(RuntimeError):
+            await waiting
+
+        self.assertEqual(lines[0], "UDP socket on port 40000, IPv6 no; STUN: no answer")
+        self.assertEqual(lines[1], "announcing 192.0.2.10:40000")
+        self.assertRegex(lines[2], r"^peer announces 198\.51\.100\.7:5000, \[2001:db8::7\]:5000; NAT cone; after \d+ ms$")
+        self.assertEqual(lines[3], "probing them from: 198.51.100.7 <- 192.0.2.10, 2001:db8::7 <- no route")
+        self.assertRegex(lines[4], r"^first probe from 198\.51\.100\.7:5000 \(announced\) after \d+ ms$")
+        self.assertEqual(len(lines), 5)
+        self.assertRegex(
+            summary,
+            r"^after \d+ ms: sent 2 probes \(1 not sent by the system, first \[2001:db8::7\]:5000: the socket has no IPv6\) "
+            r"to 198\.51\.100\.7:5000, \[2001:db8::7\]:5000; received 1 probes and 0 answers, 1 other datagrams$",
+        )
 
 
 if __name__ == "__main__":

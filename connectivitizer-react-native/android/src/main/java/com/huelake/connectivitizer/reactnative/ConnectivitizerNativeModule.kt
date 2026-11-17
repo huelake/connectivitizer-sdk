@@ -3,9 +3,11 @@ package com.huelake.connectivitizer.reactnative
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.system.OsConstants
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.io.IOException
+import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -79,6 +81,8 @@ class ConnectivitizerNativeModule : Module() {
       val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
       val ipv4 = mutableListOf<String>()
       val ipv6 = mutableListOf<String>()
+      // Addresses the system no longer sends from (their prefix was replaced): announced last, cut first.
+      val deprecated = mutableListOf<String>()
       @Suppress("DEPRECATION")
       for (network in manager.allNetworks) {
         val capabilities = manager.getNetworkCapabilities(network) ?: continue
@@ -92,17 +96,36 @@ class ConnectivitizerNativeModule : Module() {
           if (address is Inet4Address && local && !address.isLoopbackAddress && !address.isLinkLocalAddress) {
             ipv4.add(address.hostAddress ?: continue)
           } else if (address is Inet6Address && (local || mobile) && isGlobal(address)) {
-            ipv6.add(address.hostAddress?.substringBefore('%') ?: continue)
+            val text = address.hostAddress?.substringBefore('%') ?: continue
+            if ((link.flags and OsConstants.IFA_F_DEPRECATED) != 0) deprecated.add(text) else ipv6.add(text)
           }
         }
       }
-      ipv4.distinct().take(2) + ipv6.distinct().take(4)
+      // First the address the phone sends from: only a few are announced, and the firewalls on the way open
+      // only for that one (docs/protocol, 6.3).
+      ipv4.distinct().take(2) + (listOfNotNull(outgoingIpv6()) + ipv6 + deprecated).distinct().take(4)
     }
 
     OnDestroy {
       sockets.values.forEach { it.close() }
       sockets.clear()
     }
+  }
+
+  /**
+   * The address this phone sends from to the IPv6 internet, as its routing and address selection decide
+   * (usually a temporary address of the active network). A UDP socket is given a destination and asked for
+   * its own address: nothing is sent. Null without IPv6 or without a route.
+   */
+  private fun outgoingIpv6(): String? = try {
+    DatagramSocket().use { socket ->
+      // Any global address has the same route; this one is reserved for documentation (RFC 3849).
+      socket.connect(InetAddress.getByName("2001:db8::1"), 9)
+      val local = socket.localAddress
+      if (local is Inet6Address && isGlobal(local)) local.hostAddress?.substringBefore('%') else null
+    }
+  } catch (e: Exception) {
+    null
   }
 
   /** A global unicast IPv6 address (2000::/3). */

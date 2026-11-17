@@ -88,6 +88,20 @@ public sealed class ConnectivitizerClientOptions
     /// sessions. Not available to applications.
     /// </summary>
     internal string? GatewaySecret { get; init; }
+
+    /// <summary>
+    /// Set by a device that opens sessions itself: its own signaling connection, once it is connected. The
+    /// client then logs in nowhere and owns neither that connection nor <see cref="TcpListener"/>.
+    /// </summary>
+    internal Func<CancellationToken, Task<SignalingClient>>? Signaling { get; init; }
+
+    /// <summary>The device's listener for direct TCP paths, shared with the sessions it opens.</summary>
+    internal TcpDirectListener? TcpListener { get; init; }
+
+    /// <summary>Called when the opening of a session is over, whether it succeeded or not.</summary>
+    internal Action<string>? Opened { get; init; }
+
+    internal Action<string>? Log { get; init; }
 }
 
 /// <summary>
@@ -116,15 +130,17 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
     private readonly ConcurrentDictionary<string, TaskCompletionSource<SignalConnectAnswer>> _answers = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<byte[]>> _candidates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, TunnelSession> _sessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, bool> _own = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _stop = new();
     private readonly TcpDirectListener? _tcpListener;
     private SignalingClient? _signaling;
+    private int _requesting;
     private int _disposed;
 
     public ConnectivitizerClient(ConnectivitizerClientOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        if (options.ApiKey is null == options.TokenProvider is null)
+        if (options.Signaling is null && options.ApiKey is null == options.TokenProvider is null)
         {
             throw new ArgumentException("Set exactly one of ApiKey and TokenProvider.", nameof(options));
         }
@@ -134,7 +150,23 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
         }
         _api = new PlatformApi(options.ApiUrl, options.HttpClient);
         _grants = new GrantVerifier(_api);
-        _tcpListener = !options.DisableDirect && options.DirectTransports.HasFlag(DirectTransports.Tcp) ? new TcpDirectListener(options.TcpListenPort) : null;
+        _tcpListener = options.Signaling is not null ? options.TcpListener
+            : !options.DisableDirect && options.DirectTransports.HasFlag(DirectTransports.Tcp) ? new TcpDirectListener(options.TcpListenPort) : null;
+    }
+
+    /// <summary>True for a session this client asked for, from the moment the platform granted it until it has ended.</summary>
+    internal bool Owns(string sessionId) => _own.ContainsKey(sessionId);
+
+    /// <summary>The sessions this client opened that are still running.</summary>
+    internal IReadOnlyCollection<ConnectionInfo> Sessions => _sessions.Values.Select(s => s.Info).ToArray();
+
+    /// <summary>Ends every session this client opened.</summary>
+    internal async Task EndAllAsync(string reason)
+    {
+        foreach (TunnelSession session in _sessions.Values.ToArray())
+        {
+            await session.EndAsync(reason).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -150,17 +182,36 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
         SharedKey? sharedKey = SelectSharedKey(device);
         SignalingClient signaling = await EnsureSignalingAsync(cancellationToken).ConfigureAwait(false);
 
-        SignalEnvelope reply = await signaling.RequestAsync(SignalTypes.ConnectRequest,
-            new SignalConnectRequest
+        SignalConnectGrant granted;
+        string sessionId;
+        Interlocked.Increment(ref _requesting);
+        try
+        {
+            SignalEnvelope reply = await signaling.RequestAsync(SignalTypes.ConnectRequest,
+                new SignalConnectRequest
+                {
+                    Device = device,
+                    Services = serviceNames,
+                    Modes = _options.GatewaySecret is null ? _options.Modes : [ConnectionModes.Compatibility],
+                    E2e = _options.GatewaySecret is null ? AcceptableE2e(device, sharedKey) : null,
+                },
+                ProtocolJsonContext.Default.SignalConnectRequest, AnswerTimeout, cancellationToken).ConfigureAwait(false);
+            granted = SignalingClient.Read(reply, SignalTypes.ConnectGrant, ProtocolJsonContext.Default.SignalConnectGrant);
+            sessionId = granted.SessionId;
+            _own[sessionId] = true;
+        }
+        finally
+        {
+            if (Interlocked.Decrement(ref _requesting) == 0 && _options.Signaling is not null)
             {
-                Device = device,
-                Services = serviceNames,
-                Modes = _options.GatewaySecret is null ? _options.Modes : [ConnectionModes.Compatibility],
-                E2e = _options.GatewaySecret is null ? AcceptableE2e(device, sharedKey) : null,
-            },
-            ProtocolJsonContext.Default.SignalConnectRequest, AnswerTimeout, cancellationToken).ConfigureAwait(false);
-        SignalConnectGrant granted = SignalingClient.Read(reply, SignalTypes.ConnectGrant, ProtocolJsonContext.Default.SignalConnectGrant);
-        string sessionId = granted.SessionId;
+                // On a device's connection, candidates of sessions opened to it pass by as well. Those kept while
+                // the session id of this request was unknown are dropped.
+                foreach (string other in _candidates.Keys.Where(id => !_own.ContainsKey(id)).ToArray())
+                {
+                    _candidates.TryRemove(other, out _);
+                }
+            }
+        }
 
         try
         {
@@ -248,6 +299,8 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
             }
 
             _sessions[sessionId] = session;
+            _options.Log?.Invoke($"session {sessionId} opened to {peerLabel} ({session.Info.Mode}, {TrustLevels.Wire(session.Info.Trust)}"
+                + (session.Info.PeerAddress is null ? ")" : $", peer at {session.Info.PeerAddress})"));
             await ReportAsync(new SignalSessionUpdate
             {
                 SessionId = sessionId,
@@ -271,8 +324,13 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
                 PlatformException p => p.ErrorCode,
                 _ => ErrorCodes.SessionClosed,
             };
+            _own.TryRemove(sessionId, out _);
             await ReportAsync(new SignalSessionUpdate { SessionId = sessionId, State = SessionStates.Failed, Error = code }).ConfigureAwait(false);
             throw;
+        }
+        finally
+        {
+            _options.Opened?.Invoke(sessionId);
         }
     }
 
@@ -294,6 +352,7 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
             TcpListener = _tcpListener,
             PublicTcpEndpoints = tcp ? await StunClient.ResolveAsync(_options.PublicTcpEndpoints, cancellationToken).ConfigureAwait(false) : [],
             PeerReflexive = DirectAttemptOptions.PeerReflexiveFor(grant),
+            Log = _options.Log is { } log ? message => log($"session {sessionId}: direct: {message}") : null,
         });
         try
         {
@@ -407,6 +466,10 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
     private async Task<SignalingClient> EnsureSignalingAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        if (_options.Signaling is { } current)
+        {
+            return _signaling = await current(cancellationToken).ConfigureAwait(false);
+        }
         await _signalingGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -449,7 +512,8 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
         }
     }
 
-    private async Task OnSignalAsync(SignalEnvelope message)
+    /// <summary>Takes a message from the signaling connection. A device passes on what concerns the sessions it opened.</summary>
+    internal async Task OnSignalAsync(SignalEnvelope message)
     {
         switch (message.Type)
         {
@@ -458,6 +522,10 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
                 break;
 
             case SignalTypes.PathCandidates when Deserialize(message, ProtocolJsonContext.Default.SignalPathCandidates) is { } candidates:
+                if (_options.Signaling is not null && !_own.ContainsKey(candidates.SessionId) && Volatile.Read(ref _requesting) == 0)
+                {
+                    break;
+                }
                 try
                 {
                     _candidates.GetOrAdd(candidates.SessionId, _ => NewCandidateSource()).TrySetResult(Convert.FromBase64String(candidates.Blob));
@@ -497,6 +565,8 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
     {
         string reason = await session.Completion.ConfigureAwait(false);
         _sessions.TryRemove(session.Info.SessionId, out _);
+        _own.TryRemove(session.Info.SessionId, out _);
+        _options.Log?.Invoke($"session {session.Info.SessionId} ended ({reason})");
         await ReportAsync(new SignalSessionUpdate
         {
             SessionId = session.Info.SessionId,
@@ -578,14 +648,14 @@ public sealed class ConnectivitizerClient : IAsyncDisposable
         {
             await session.DisposeAsync().ConfigureAwait(false);
         }
-        if (_tcpListener is not null)
+        if (_tcpListener is not null && _options.Signaling is null)
         {
             await _tcpListener.DisposeAsync().ConfigureAwait(false);
         }
         // Give the end-of-session reports a moment to leave before the channel closes.
         await Task.Delay(50).ConfigureAwait(false);
         await _stop.CancelAsync().ConfigureAwait(false);
-        if (_signaling is not null)
+        if (_signaling is not null && _options.Signaling is null)
         {
             await _signaling.DisposeAsync().ConfigureAwait(false);
         }

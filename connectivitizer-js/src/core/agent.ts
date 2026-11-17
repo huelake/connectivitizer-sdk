@@ -1,6 +1,6 @@
-import { GrantVerifier, PlatformApi, type TokenResponse } from './api.js';
+import { GrantVerifier, PlatformApi, type ReachableDevice, type TokenResponse } from './api.js';
 import { base64Decode, base64Encode } from './bytes.js';
-import type { CertificateSupport } from './client.js';
+import { type CertificateSupport, ConnectivitizerClient } from './client.js';
 import { DirectAttempt, peerReflexiveFor } from './direct/attempt.js';
 import { ConnectivitizerError, ErrorCodes, codeOf } from './errors.js';
 import { Capabilities, ConnectionModes, E2eMethods, Roles, type SessionGrant, e2eMethodOf } from './grants.js';
@@ -36,7 +36,11 @@ export interface AgentOptions {
    */
   login?: (api: PlatformApi) => Promise<TokenResponse>;
 
-  /** The key (or keys) this device shares with the applications that connect, as `czs_…` text or parsed. */
+  /**
+   * The key (or keys) this device shares with the applications that connect, as `czs_…` text or parsed. For a
+   * session the device opens itself, the one named like the other device is used, else the only one, else the
+   * one named `default`.
+   */
   sharedKey?: string | SharedKey | readonly SharedKey[];
 
   /** The services this device exposes, by name. Nothing else is reachable. */
@@ -83,6 +87,9 @@ function parseTarget(target: string): { host: string; port: number } {
  * The device side: keeps an outbound connection to the platform, and when an authorised
  * application that holds the shared key asks, opens a session and forwards its streams to local
  * services. Nothing is reachable that the device did not declare itself, and no port listens.
+ *
+ * A device can also open sessions to other devices ({@link connect}), over the same connection to
+ * the platform, when the device key it logs in with has the right to connect.
  */
 export class ConnectivitizerAgent {
   private readonly api: PlatformApi;
@@ -98,6 +105,10 @@ export class ConnectivitizerAgent {
   private stopped = false;
   private readonly stopSignal = new Deferred<void>();
   private connected = new Deferred<void>();
+  /** Resolves when the device will not connect again: with null once it is stopped, with the error when the platform does not accept it. */
+  private readonly over = new Deferred<unknown>();
+  /** The calling half: the sessions this device opens to other devices. */
+  private readonly caller: ConnectivitizerClient;
 
   constructor(private readonly options: AgentOptions) {
     this.keys = toKeys(options.sharedKey);
@@ -116,6 +127,27 @@ export class ConnectivitizerAgent {
     }
     this.api = new PlatformApi(options.apiUrl, options.platform);
     this.grants = new GrantVerifier(this.api, () => this.nowSeconds());
+    this.caller = new ConnectivitizerClient(
+      {
+        apiUrl: options.apiUrl,
+        auth: { getToken: () => this.login() },
+        sharedKey: this.keys,
+        disableDirect: options.disableDirect,
+        stunServers: options.stunServers,
+        certificates: options.certificates,
+        platform: options.platform,
+      },
+      {
+        connected: () => this.currentSignaling(),
+        current: () => this.signaling,
+        nowSeconds: () => this.nowSeconds(),
+        opened: (sessionId) => {
+          this.candidates.delete(sessionId);
+          this.fallbacks.delete(sessionId);
+        },
+        log: (message) => this.log(message),
+      },
+    );
   }
 
   /** True while the device is connected to the platform and can be reached. */
@@ -126,6 +158,31 @@ export class ConnectivitizerAgent {
   /** The sessions currently open to this device. */
   get openSessions(): ConnectionInfo[] {
     return [...this.sessions.values()].map((session) => session.info);
+  }
+
+  /** The sessions this device opened to other devices that are still running. */
+  get outgoingSessions(): ConnectionInfo[] {
+    return this.caller.openSessions;
+  }
+
+  /**
+   * Opens a session from this device to `device` (its name or id) for the named services, over the
+   * device's own connection to the platform; it waits until the device is connected. The platform
+   * refuses with `FORBIDDEN` unless the device key this device logs in with may connect and its
+   * access rules cover the request. The shared key is chosen as an application chooses it: the one
+   * named like the other device, else the only one, else the one named `default`. Rejects with a
+   * {@link ConnectivitizerError}, as {@link ConnectivitizerClient.connect} does.
+   */
+  connect(device: string, services: string[]): Promise<TunnelSession> {
+    return this.caller.connect(device, services);
+  }
+
+  /** The devices this device may open sessions to, with the services it may use. Needs a device key that may connect. */
+  async listDevices(): Promise<ReachableDevice[]> {
+    if (!this.options.deviceKey) {
+      throw new ConnectivitizerError(ErrorCodes.Forbidden, 'Only a device that logs in with a device key can open sessions.');
+    }
+    return this.caller.listDevices();
   }
 
   /** Resolves when the agent is connected to the platform. */
@@ -143,12 +200,7 @@ export class ConnectivitizerAgent {
     while (!this.stopped) {
       try {
         const certificates = this.options.certificates;
-        const now = Math.floor(Date.now() / 1000) + this.clockOffset;
-        // An enrolled device registered its certificate when it enrolled; a key device does it with every login.
-        const token: TokenResponse = this.options.login
-          ? await this.options.login(this.api)
-          : await this.api.deviceKeyToken(this.options.deviceKey!, this.options.name!, this.options.platform.description, this.options.agentVersion,
-              certificates?.registration(this.options.deviceKey!, now));
+        const token = await this.login();
         this.deviceId = token.endpointId;
         if (typeof token.serverTime === 'number') {
           this.clockOffset = token.serverTime - Math.floor(Date.now() / 1000);
@@ -188,6 +240,7 @@ export class ConnectivitizerAgent {
         this.log(`disconnected from the platform (${reason})`);
         if (reason === ErrorCodes.DeviceRevoked || reason === ErrorCodes.CredentialRevoked) {
           await this.endAllSessions(reason);
+          await this.caller.endAll(reason);
           throw new ConnectivitizerError(reason, reason === ErrorCodes.DeviceRevoked ? 'This device was revoked.' : 'The device key this device logs in with was revoked.');
         }
       } catch (error) {
@@ -195,6 +248,7 @@ export class ConnectivitizerAgent {
         const final: string[] = [ErrorCodes.DeviceRevoked, ErrorCodes.CredentialRevoked, ErrorCodes.IdentityNotRegistered, ErrorCodes.Unauthenticated, ErrorCodes.InvalidRequest, ErrorCodes.Conflict];
         if (final.includes(code)) {
           this.log(`the platform does not accept this device (${code})`);
+          this.over.resolve(error);
           throw error;
         }
         this.log(`platform unavailable (${code}); retrying in ${Math.round(backoff / 1000)} s`);
@@ -216,10 +270,36 @@ export class ConnectivitizerAgent {
       return;
     }
     this.stopped = true;
+    this.over.resolve(null);
     await Promise.all([...this.sessions.values()].map((session) => session.close()));
+    await this.caller.close();
     await delay(50);
     this.signaling?.close();
     this.stopSignal.resolve();
+  }
+
+  /** A token of the control plane for this device. */
+  private login(): Promise<TokenResponse> {
+    // An enrolled device registered its certificate when it enrolled; a key device does it with every login.
+    return this.options.login
+      ? this.options.login(this.api)
+      : this.api.deviceKeyToken(this.options.deviceKey!, this.options.name!, this.options.platform.description, this.options.agentVersion,
+          this.options.certificates?.registration(this.options.deviceKey!, this.nowSeconds()));
+  }
+
+  /** The connection to the platform once there is one, for the sessions this device opens. Rejects when the device will not connect again. */
+  private async currentSignaling(): Promise<SignalingClient> {
+    while (true) {
+      const ended = await Promise.race([this.connected.promise.then(() => false), this.over.promise.then(() => true)]);
+      if (ended || this.stopped) {
+        const error = await this.over.promise;
+        throw error ?? new ConnectivitizerError(ErrorCodes.SessionClosed, 'The device is stopped.');
+      }
+      if (this.signaling?.isOpen) {
+        return this.signaling;
+      }
+      await delay(50);
+    }
   }
 
   private nowSeconds(): number {
@@ -248,7 +328,15 @@ export class ConnectivitizerAgent {
           void this.handleOffer(signaling, data as unknown as SignalConnectGrant);
         }
         break;
+      case 'connect.answer':
+        this.caller.onSignal(message);
+        break;
       case 'path.candidates':
+        // The candidates of a session this device opened belong to the calling half.
+        this.caller.onSignal(message);
+        if (sessionId && this.caller.owns(sessionId)) {
+          break;
+        }
         if (sessionId && typeof data.blob === 'string') {
           try {
             this.waiter(this.candidates, sessionId).resolve(base64Decode(data.blob));
@@ -263,6 +351,7 @@ export class ConnectivitizerAgent {
         }
         break;
       case 'revoke': {
+        this.caller.onSignal(message);
         const sids = Array.isArray(data.sids) ? (data.sids as string[]) : null;
         const reason = typeof data.reason === 'string' ? data.reason : ErrorCodes.SessionRevoked;
         for (const session of [...this.sessions.values()]) {
@@ -379,6 +468,7 @@ export class ConnectivitizerAgent {
     if (this.directPossible(grant, offer.peer)) {
       const attempt = new DirectAttempt(this.options.platform, Roles.Device, sessionId, offer.grant, this.options.stunServers ?? signaling.welcome.stunServers ?? [], {
         peerReflexive: peerReflexiveFor(e2eMethodOf(grant)),
+        log: (line) => this.log(`session ${sessionId}: ${line}`),
       });
       try {
         void this.waiter(this.candidates, sessionId).promise.then((blob) => attempt.setRemoteCandidates(blob), () => undefined);
@@ -409,8 +499,10 @@ export class ConnectivitizerAgent {
           }
           await first.path.stream.close().catch(() => undefined);
           this.log(`session ${sessionId}: no direct path (${outcome.reason}), using the relay`);
+          this.log(`session ${sessionId}: direct: ${attempt.summary()}`);
         } else {
           this.log(`session ${sessionId}: no direct path (${first.reason}), using the relay`);
+          this.log(`session ${sessionId}: direct: ${attempt.summary()}`);
         }
       } finally {
         attempt.close();

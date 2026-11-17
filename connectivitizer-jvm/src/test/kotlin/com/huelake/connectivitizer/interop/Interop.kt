@@ -4,6 +4,10 @@
 //   InteropKt client   a calling application: connects, uses the service every way the SDK offers, prints one JSON report
 //   InteropKt device   a device: logs in with a device key, exposes CZ_TARGET as CZ_SERVICE, prints READY, then its log
 //   InteropKt link     links itself to an account: prints PROMPT <json>, then LINKED <json> or FAILED <code>
+//
+// With CZ_CALL=<device>/<service> the device, once connected, opens a session to that device and does GET /hello on
+// that service. It prints one line "CALLED <mode> <body>", or "CALL_FAILED <code>", and keeps that session open
+// until it stops.
 package com.huelake.connectivitizer.interop
 
 import com.huelake.connectivitizer.ConnectivitizerAgent
@@ -14,6 +18,7 @@ import com.huelake.connectivitizer.Platform
 import com.huelake.connectivitizer.WebSocketMessage
 import com.huelake.connectivitizer.internal.Bytes
 import com.huelake.connectivitizer.internal.Json
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -122,6 +127,19 @@ private fun device(): Int {
         launch {
             agent.waitUntilConnected()
             println("READY")
+            System.out.flush()
+            val call = System.getenv("CZ_CALL")?.takeIf { it.isNotEmpty() } ?: return@launch
+            val line = try {
+                val device = call.substringBefore('/')
+                val service = call.substringAfter('/')
+                val session = agent.connect(device, listOf(service))
+                "CALLED ${session.info.mode} ${session.fetch(service, "/hello").text()}"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                "CALL_FAILED ${(e as? ConnectivitizerException)?.code ?: e.javaClass.simpleName}"
+            }
+            println(line)
             System.out.flush()
         }
         try {

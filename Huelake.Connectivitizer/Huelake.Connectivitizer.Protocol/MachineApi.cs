@@ -20,6 +20,12 @@ public static class MachineScopes
 
     /// <summary>Manage the workspace through the REST API (devices, credentials, policies).</summary>
     public const string Manage = "manage";
+
+    /// <summary>
+    /// The key belongs to a linked app. One that manages does so for devices and keys; who is a
+    /// member of the workspace stays with people and with keys a person created.
+    /// </summary>
+    public const string Linked = "linked";
 }
 
 /// <summary>
@@ -154,6 +160,12 @@ public sealed record LinkStartRequest
 
     /// <summary>What the app runs on, for example "android". Shown to the person who approves.</summary>
     [JsonPropertyName("platform")] public string? Platform { get; init; }
+
+    /// <summary>
+    /// The app asks to manage the workspace as well: keys, devices, who may reach what. Only an admin
+    /// can approve such a link, and the key it leads to expires.
+    /// </summary>
+    [JsonPropertyName("manage")] public bool? Manage { get; init; }
 }
 
 public sealed record LinkStartResponse
@@ -197,6 +209,12 @@ public sealed record LinkTokenResponse
     [JsonPropertyName("workspaceId")] public string? WorkspaceId { get; init; }
 
     [JsonPropertyName("workspaceName")] public string? WorkspaceName { get; init; }
+
+    /// <summary>Whether the key may manage the workspace.</summary>
+    [JsonPropertyName("manage")] public bool? Manage { get; init; }
+
+    /// <summary>When the key stops working, if it does.</summary>
+    [JsonPropertyName("expiresAt")] public DateTime? ExpiresAt { get; init; }
 
     [JsonPropertyName("credentialId")] public string? CredentialId { get; init; }
 

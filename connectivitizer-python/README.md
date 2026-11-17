@@ -56,6 +56,31 @@ await agent.run()   # until await agent.stop(); reconnects by itself, raises whe
 
 The device appears in the workspace the first time it connects. `Service(target, protocol, allow=["key:<name>"])` restricts a service to holders of one of the device's keys.
 
+## A device that calls another device
+
+A running device opens sessions to other devices over its own connection to the platform. It needs no API key: the platform uses the rights of the device key the device logs in with.
+
+- The device key has "Its devices may open sessions to other devices" switched on (web app: *Credentials*). Without it the platform refuses with `FORBIDDEN`.
+- The device holds the other device's shared key. With several keys, the one named like the other device is used, else the only one, else the one named `default`.
+
+```python
+agent = Agent(api_url, device_key="czd_…", name="hall-panel", shared_key="czs_…",
+              services={"api": "127.0.0.1:8080"}, log=print)
+running = asyncio.ensure_future(agent.run())
+
+session = await agent.connect("living-room-lamp", ["api"])   # waits until the device is connected
+response = await session.fetch("api", "/state")
+print(response.status, await response.json(), session.info.mode)
+```
+
+| | |
+|---|---|
+| `await agent.connect(device, services)` | Opens a session to another device by its name. The session is the same object the calling side gets (`fetch`, `websocket`, `open_stream`, `info`, `close`). |
+| `await agent.list_devices()` | The devices this device may reach, without itself: name, alias, online, and the services it may use. |
+| `agent.outgoing_sessions` | The `info` of the sessions this device opened that are still running. `agent.open_sessions` lists the sessions opened to it. |
+
+Sessions the device opened stay open while it reconnects to the platform, and end when the device stops, or when the device or its device key is revoked.
+
 ## Direct sessions
 
 Nothing to configure. `Platform` binds a dual-stack UDP socket on a port the system picks and finds the machine's addresses itself (the source address of each default route, the addresses of the host name, and on Linux the kernel's IPv6 list); the SDK then offers the local IPv4 address, global IPv6 addresses and the public address STUN reports, and punches through the routers. `Platform(ssl_context=…)` trusts the certificate authority of a self-hosted installation.

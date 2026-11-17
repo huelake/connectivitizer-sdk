@@ -27,6 +27,12 @@ export interface LinkOptions {
   platformName?: string;
 
   /**
+   * Ask to manage the workspace as well: keys, devices, who may reach what. For tools, not for
+   * apps: only an admin can approve it, and the key expires after some weeks.
+   */
+  manage?: boolean;
+
+  /**
    * Sends the person to the web app: open `url` in a browser, or show it as a link or QR code
    * together with `code`. Linking continues in the background while they are there.
    */
@@ -44,6 +50,10 @@ export interface LinkedApp {
   /** The name the app got in the workspace: the one it asked for, made distinct if it was taken. */
   client: string;
   credentialId: string;
+  /** Whether the key may manage the workspace. */
+  manage: boolean;
+  /** When the key stops working, if it does (ISO 8601). */
+  expiresAt?: string;
 }
 
 /**
@@ -56,7 +66,7 @@ export interface LinkedApp {
  */
 export async function linkWith(platform: Pick<Platform, 'fetch'>, options: LinkOptions): Promise<LinkedApp> {
   const api = new PlatformApi(options.apiUrl, platform as Platform);
-  const link = await api.startLink(options.client, options.platformName);
+  const link = await api.startLink(options.client, options.platformName, options.manage);
   await options.onPrompt({ url: link.verificationUrlComplete, page: link.verificationUrl, code: link.userCode, expiresIn: link.expiresIn });
 
   const deadline = Date.now() + link.expiresIn * 1000;
@@ -74,6 +84,8 @@ export async function linkWith(platform: Pick<Platform, 'fetch'>, options: LinkO
         workspaceName: answer.workspaceName ?? '',
         client: answer.client ?? options.client,
         credentialId: answer.credentialId ?? '',
+        manage: answer.manage === true,
+        expiresAt: answer.expiresAt ?? undefined,
       };
     }
   }

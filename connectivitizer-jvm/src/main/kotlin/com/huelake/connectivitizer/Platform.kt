@@ -78,6 +78,14 @@ internal class SocketStream(private val socket: Socket, scope: CoroutineScope) :
 class UdpSocket internal constructor(private val channel: DatagramChannel, val port: Int, val ipv6: Boolean) {
     var onMessage: ((ByteArray, String, Int) -> Unit)? = null
 
+    /** Datagrams the system refused to send (no route, no address of that family, ...). */
+    internal var sendFailures = 0L
+        private set
+
+    /** The first destination a send failed for and why; null when every send went out. */
+    internal var firstSendFailure: String? = null
+        private set
+
     fun send(data: ByteArray, host: String, port: Int) {
         if (Addresses.isIpv6(host) && !ipv6) return // an IPv6 candidate this socket cannot reach
         val bytes = Addresses.ipv4Bytes(host) ?: Addresses.ipv6Bytes(host) ?: return
@@ -85,8 +93,14 @@ class UdpSocket internal constructor(private val channel: DatagramChannel, val p
             channel.send(ByteBuffer.wrap(data), InetSocketAddress(InetAddress.getByAddress(bytes), port))
         } catch (e: IOException) {
             // No route to that address: just a candidate that does not work.
+            sendFailed(host, port, e)
         } catch (e: SecurityException) {
+            sendFailed(host, port, e)
         }
+    }
+
+    private fun sendFailed(host: String, port: Int, error: Exception) {
+        if (++sendFailures == 1L) firstSendFailure = "${if (Addresses.isIpv6(host)) "[$host]:$port" else "$host:$port"}: ${error.message ?: error.javaClass.simpleName}"
     }
 
     fun close() {
@@ -203,10 +217,12 @@ open class Platform @JvmOverloads constructor(
     /**
      * This machine's own addresses, offered to the peer: IPv4 on its networks and IPv6 (the core keeps only
      * global ones). VPN interfaces are skipped: traffic to the local network and the internet leaves over the
-     * underlying network anyway.
+     * underlying network anyway. The IPv6 address this machine sends from comes first: the core announces
+     * only a few, and that one has to be among them (docs/protocol, 6.3).
      */
     internal open suspend fun localAddresses(): List<String> = withContext(Dispatchers.IO) {
         val found = ArrayList<String>()
+        outgoingIpv6()?.let { found.add(it) }
         val vpn = Regex("^(tun|tap|ppp|utun|wg|ipsec|zt)\\d*", RegexOption.IGNORE_CASE)
         for (nic in NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()) {
             try {
@@ -222,6 +238,37 @@ open class Platform @JvmOverloads constructor(
             }
         }
         found
+    }
+
+    /**
+     * The address this machine sends from to the IPv6 internet, as its routing and address selection decide
+     * (RFC 6724; usually a temporary address). Null without IPv6 or without a route.
+     */
+    private fun outgoingIpv6(): String? {
+        // Any global address has the same route; this one is reserved for documentation (RFC 3849).
+        val local = outgoingAddress("2001:db8::1") ?: return null
+        return if (local is Inet6Address && !local.isLinkLocalAddress) Addresses.normalizeHost(local.hostAddress.substringBefore('%')) else null
+    }
+
+    /**
+     * The local address the system sends from to reach a host, by its routing table. A UDP socket is given
+     * the destination and asked for its own address: nothing is sent. Null without a route.
+     */
+    private fun outgoingAddress(host: String): InetAddress? {
+        val bytes = Addresses.ipv4Bytes(host) ?: Addresses.ipv6Bytes(host) ?: return null
+        return try {
+            java.net.DatagramSocket().use { socket ->
+                socket.connect(InetAddress.getByAddress(bytes), 9)
+                socket.localAddress?.takeUnless { it.isAnyLocalAddress }
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** The local address this machine sends from to reach a peer's address, for the log; null without a route. */
+    internal open suspend fun sourceAddress(host: String): String? = withContext(Dispatchers.IO) {
+        outgoingAddress(host)?.let { Addresses.normalizeHost(it.hostAddress.substringBefore('%')) }
     }
 
     /** The IPv4 address of a host name (for STUN servers given by name). */

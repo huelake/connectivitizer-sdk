@@ -18,13 +18,16 @@ import com.huelake.connectivitizer.internal.string
 import com.huelake.connectivitizer.internal.strings
 import com.huelake.connectivitizer.internal.withTimeoutOr
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.future.future
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 import kotlin.random.Random
 
@@ -38,6 +41,9 @@ import kotlin.random.Random
  *     .service("api", "127.0.0.1:8080").log { println(it) }.build()
  * agent.run()   // until agent.stop(); from Java: runBlocking() and stopBlocking()
  * ```
+ *
+ * A device can also open sessions to other devices ([connect]), over the same connection to the platform, when
+ * the device key it logs in with has the right to connect.
  */
 class ConnectivitizerAgent private constructor(private val options: Builder) {
     private val runtime = SdkRuntime("connectivitizer-agent")
@@ -53,6 +59,7 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
     private var signaling: Signaling? = null
     private var deviceId: String? = null
     private var clockOffset = 0L
+    @Volatile
     private var stopped = false
     private val stopSignal = CompletableDeferred<Unit>()
     private var connected = CompletableDeferred<Unit>()
@@ -61,6 +68,29 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
         if (keys.isEmpty()) throw ConnectivitizerException(ErrorCodes.INVALID_REQUEST, "A device needs a shared key: without one nobody can reach it end to end.")
         if (options.deviceKey == null || options.name == null) throw ConnectivitizerException(ErrorCodes.INVALID_REQUEST, "A device logs in with a device key and its name.")
     }
+
+    /**
+     * The calling half: the sessions this device opens. It runs on the device's thread and uses the device's
+     * connection to the platform, its clock and its log.
+     */
+    private val caller = ConnectivitizerClient.Builder(options.apiUrl).also {
+        it.keys.addAll(keys)
+        it.disableDirect = options.disableDirect
+        it.stunServers = options.stunServers
+        it.platform = platform
+        it.attachment = DeviceAttachment(
+            runtime,
+            signaling = { currentSignaling() },
+            current = { signaling },
+            nowSeconds = { nowSeconds() },
+            opened = { sessionId ->
+                // Candidates that arrived before the platform's grant named the session were kept here as well.
+                candidates.remove(sessionId)
+                fallbacks.remove(sessionId)
+            },
+            log = { log(it) },
+        )
+    }.build()
 
     class Builder internal constructor(internal val apiUrl: String) {
         internal var deviceKey: String? = null
@@ -122,7 +152,57 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
     /** The sessions currently open to this device. */
     val openSessions: List<ConnectionInfo> get() = sessions.values.map { it.info }
 
+    /** The sessions this device opened to other devices that are still running. */
+    val outgoingSessions: List<ConnectionInfo> get() = caller.openSessions
+
     suspend fun waitUntilConnected() = connected.await()
+
+    /**
+     * Opens a session from this device to [device] (its name or id) for the named services, over the device's own
+     * connection to the platform; it waits until the device is connected, so [run] must be running. The platform
+     * refuses with `FORBIDDEN` unless the device key this device logs in with may connect and its access rules
+     * cover the request. The shared key is chosen as an application chooses it: the one named like the other
+     * device, else the only one, else the one named `default`. Errors are those of [ConnectivitizerClient.connect].
+     */
+    suspend fun connect(device: String, services: List<String>): TunnelSession {
+        refuseWhenStopped()
+        return withContext(runtime.dispatcher) { caller.connectOnSdk(device, services) }
+    }
+
+    fun connectBlocking(device: String, services: List<String>): TunnelSession = runBlocking { connect(device, services) }
+
+    fun connectAsync(device: String, services: List<String>): CompletableFuture<TunnelSession> {
+        if (stopped) return CompletableFuture<TunnelSession>().also { it.completeExceptionally(ConnectivitizerException(ErrorCodes.SESSION_CLOSED, "The device is stopped.")) }
+        return scope.future { caller.connectOnSdk(device, services) }
+    }
+
+    /** The devices this device may open sessions to, with the services it may use. Needs a device key that may connect. */
+    suspend fun listDevices(): List<ReachableDevice> {
+        refuseWhenStopped()
+        return withContext(runtime.dispatcher) {
+            api.reachableDevices(api.deviceKeyToken(options.deviceKey!!, options.name!!, platform.description, options.agentVersion).accessToken)
+        }
+    }
+
+    fun listDevicesBlocking(): List<ReachableDevice> = runBlocking { listDevices() }
+
+    private fun refuseWhenStopped() {
+        if (stopped) throw ConnectivitizerException(ErrorCodes.SESSION_CLOSED, "The device is stopped.")
+    }
+
+    /** The connection to the platform, once the device is connected. The calling half waits here while the device reconnects. */
+    private suspend fun currentSignaling(): Signaling {
+        while (true) {
+            refuseWhenStopped()
+            signaling?.takeIf { it.isOpen }?.let { return it }
+            val waiting = connected
+            // Between the end of a connection and the run loop taking note of it, there is nothing to wait on.
+            if (waiting.isCompleted) delay(50) else select<Unit> {
+                waiting.onAwait { }
+                stopSignal.onAwait { }
+            }
+        }
+    }
 
     /**
      * Runs until [stop] is called, reconnecting with back-off whenever the connection to the platform is lost.
@@ -137,10 +217,14 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
         withContext(runtime.dispatcher) {
             if (stopped) return@withContext
             stopped = true
-            for (session in sessions.values.toList()) runCatching { session.close() }
-            delay(50)
-            signaling?.close()
-            stopSignal.complete(Unit)
+            try {
+                for (session in sessions.values.toList()) runCatching { session.close() }
+                caller.closeSessions()
+                delay(50)
+                signaling?.close()
+            } finally {
+                stopSignal.complete(Unit)
+            }
         }
     }
 
@@ -185,6 +269,7 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
                     log("disconnected from the platform ($reason)")
                     if (reason == ErrorCodes.DEVICE_REVOKED || reason == ErrorCodes.CREDENTIAL_REVOKED) {
                         for (session in sessions.values.toList()) runCatching { session.end(reason) }
+                        caller.endAll(reason)
                         throw ConnectivitizerException(reason, if (reason == ErrorCodes.DEVICE_REVOKED) "This device was revoked." else "The device key this device logs in with was revoked.")
                     }
                 } catch (e: ConnectivitizerException) {
@@ -203,7 +288,11 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
                 backoff = minOf(backoff * 2, 30_000)
             }
         } finally {
-            if (stopped) runtime.shutdown()
+            if (stopped) {
+                // The thread ends once stop() is through with it: closing the connection still runs there.
+                withContext(NonCancellable) { stopSignal.await() }
+                runtime.shutdown()
+            }
         }
     }
 
@@ -214,9 +303,15 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
         val sessionId = data.string("sid")
         when (message["t"]) {
             "connect.offer" -> if (sessionId != null && data.string("grant") != null && data.map("peer") != null) scope.launch { handleOffer(channel, data) }
-            "path.candidates" -> if (sessionId != null) data.string("blob")?.let { blob -> runCatching { Bytes.base64Decode(blob) }.getOrNull()?.let { waiter(candidates, sessionId).complete(it) } }
+            "connect.answer" -> caller.onSignal(message)
+            "path.candidates" -> {
+                // The candidates of a session this device opened belong to the calling half.
+                caller.onSignal(message)
+                if (sessionId != null && !caller.owns(sessionId)) data.string("blob")?.let { blob -> runCatching { Bytes.base64Decode(blob) }.getOrNull()?.let { waiter(candidates, sessionId).complete(it) } }
+            }
             "path.fallback" -> if (sessionId != null) waiter(fallbacks, sessionId).complete(data.string("reason") ?: "unknown")
             "revoke" -> {
+                caller.onSignal(message)
                 val sids = data["sids"].asList()
                 val reason = data.string("reason") ?: ErrorCodes.SESSION_REVOKED
                 for (session in sessions.values.toList()) {
@@ -296,7 +391,7 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
 
         if (directPossible(grant, peer)) {
             val stun = options.stunServers ?: channel.welcome.strings("stunServers") ?: emptyList()
-            val attempt = DirectAttempt(platform, Roles.DEVICE, sessionId, grantToken, stun, peerReflexiveFor(grant.e2eMethod), scope)
+            val attempt = DirectAttempt(platform, Roles.DEVICE, sessionId, grantToken, stun, peerReflexiveFor(grant.e2eMethod), scope) { log("session $sessionId: direct: $it") }
             try {
                 scope.launch { runCatching { attempt.setRemoteCandidates(waiter(candidates, sessionId).await()) } }
                 val fallback = waiter(fallbacks, sessionId)
@@ -323,9 +418,11 @@ class ConnectivitizerAgent private constructor(private val options: Builder) {
                     direct.cancel()
                     runCatching { first.stream.close() }
                     log("session $sessionId: no direct path ($outcome), using the relay")
+                    log("session $sessionId: direct: ${attempt.summary()}")
                 } else {
                     selection.cancel()
                     log("session $sessionId: no direct path ($first), using the relay")
+                    log("session $sessionId: direct: ${attempt.summary()}")
                 }
             } finally {
                 attempt.close()

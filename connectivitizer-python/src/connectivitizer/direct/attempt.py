@@ -93,6 +93,10 @@ def read_stun_success(datagram: bytes, transaction_id: bytes) -> Optional[str]:
     return None
 
 
+def _join(items: Sequence[str]) -> str:
+    return ", ".join(items) or "(none)"
+
+
 class DirectAttempt:
     def __init__(
         self,
@@ -103,13 +107,17 @@ class DirectAttempt:
         stun_servers: Sequence[str],
         peer_reflexive: bool = False,
         announce_filter: Optional[Callable[[List[str]], List[str]]] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> None:
+        """``log`` receives one line per step of the attempt (addresses announced, first probe, the count at
+        the end)."""
         self._platform = platform
         self._role = role
         self._session_id = session_id
         self._stun_servers = list(stun_servers)
         self._peer_reflexive = peer_reflexive
         self._announce_filter = announce_filter
+        self._log_sink = log
         # Both endpoints hold the same grant, so both derive the same tag and KCP conversation id.
         digest = hashlib.sha256(grant_token.encode("utf-8")).digest()
         self._tag = digest[:8]
@@ -135,12 +143,21 @@ class DirectAttempt:
         self._has_stun_servers = False
         self._handed_over = False
         self._closed = False
+        self._started = time.monotonic()
+        self._probes_sent = 0
+        self._probes_received = 0
+        self._answers_received = 0
+        self._foreign_datagrams = 0
 
     async def gather(self) -> bytes:
         """Discovers this endpoint's addresses and returns the candidate list to send to the peer."""
         self._socket = await self._platform.bind_udp()
         self._socket.on_message = self._on_datagram
         mapped = await self._discover()
+        self._log(
+            f"UDP socket on port {self._socket.port}, IPv6 {'yes' if self._socket.ipv6 else 'no'}; STUN: "
+            + (f"{mapped} ({'symmetric NAT' if self._stun_symmetric else 'cone'})" if mapped else "no answer")
+        )
         candidates: List[str] = []
         ipv4 = ipv6 = 0
         try:
@@ -167,6 +184,7 @@ class DirectAttempt:
         nat = "unknown" if not self._stun_reachable else "symmetric" if self._stun_symmetric else "cone"
         blob = json.dumps({"sid": self._session_id, "role": self._role, "udp": candidates, "nat": nat}, separators=(",", ":")).encode("utf-8")
         self.local_candidates_hash = hashlib.sha256(blob).hexdigest()
+        self._log(f"announcing {_join(candidates)}")
         return blob
 
     def set_remote_candidates(self, blob: bytes) -> bool:
@@ -189,6 +207,9 @@ class DirectAttempt:
                 parsed.append(address)
         self._remote_candidates = parsed
         settle(self._remote_known)
+        if self._log_sink is not None:
+            self._log(f"peer announces {_join([text for text in udp if isinstance(text, str)])}; NAT {self._remote_nat}; after {self._elapsed()} ms")
+            self._log("probing them from: " + _join([f"{target.host} <- {self._platform.source_address(target.host) or 'no route'}" for target in parsed]))
         return True
 
     def _learn(self, address: UdpAddress) -> None:
@@ -269,6 +290,27 @@ class DirectAttempt:
             return DirectFailureReasons.UDP_BLOCKED_REMOTE
         return DirectFailureReasons.PROBE_TIMEOUT
 
+    def summary(self) -> str:
+        """What this side of the attempt sent and saw, for the log when no path was found."""
+        failed = self._socket.send_failures if self._socket is not None else 0
+        failures = f" ({failed} not sent by the system, first {self._socket.first_send_failure})" if failed and self._socket is not None else ""
+        foreign = f", {self._foreign_datagrams} other datagrams" if self._foreign_datagrams else ""
+        return (
+            f"after {self._elapsed()} ms: sent {self._probes_sent} probes{failures} to {_join([format_address(target) for target in self._probe_targets()])}; "
+            f"received {self._probes_received} probes and {self._answers_received} answers{foreign}"
+        )
+
+    def _log(self, message: str) -> None:
+        if self._log_sink is not None:
+            self._log_sink(message)
+
+    def _elapsed(self) -> int:
+        """Milliseconds since the attempt was created."""
+        return int((time.monotonic() - self._started) * 1000)
+
+    def _known(self, source: UdpAddress) -> str:
+        return "announced" if source in self._remote_candidates else "learned" if source in self._learned else "not announced"
+
     def close(self) -> None:
         """Gives up the attempt. A path that was handed to a session is not affected."""
         if self._closed:
@@ -334,15 +376,26 @@ class DirectAttempt:
             return
         if data[0] in (DatagramType.PROBE, DatagramType.PROBE_ACK):
             self._on_probe(data, host, port)
+        else:
+            self._foreign_datagrams += 1
 
     def _on_probe(self, data: bytes, raw_host: str, port: int) -> None:
         if len(data) != PROBE_SIZE or not hmac.compare_digest(data[1:9], self._tag) or self._socket is None:
+            self._foreign_datagrams += 1
             return  # not for this session
         host = normalize_host(raw_host) or raw_host
         source = UdpAddress(host, port)
         self._learn(source)
         announced = source in self._remote_candidates
         flags = data[9]
+        if data[0] == DatagramType.PROBE:
+            self._probes_received += 1
+            if self._probes_received == 1:
+                self._log(f"first probe from {format_address(source)} ({self._known(source)}) after {self._elapsed()} ms")
+        else:
+            self._answers_received += 1
+            if self._answers_received == 1:
+                self._log(f"first answer from {format_address(source)} ({self._known(source)}) after {self._elapsed()} ms")
         if data[0] == DatagramType.PROBE:
             if flags == FLAG_SELECT:
                 # Only the initiator selects, and only an address from its own announced list (or, where the
@@ -355,6 +408,7 @@ class DirectAttempt:
                     # The path listens before the selection is acknowledged, so the first packets are not lost.
                     self._path = KcpPath(self._socket, host, port, self._conversation)
                     self._path.on_probe = self._on_probe
+                    self._log(f"the peer selected {format_address(source)} after {self._elapsed()} ms")
                     settle(self._selected_by_peer, self._path)
                 elif self._selected != source:
                     return
@@ -373,4 +427,5 @@ class DirectAttempt:
             for target in targets():
                 if self._socket is not None:
                     self._socket.send(probe, target.host, target.port)
+                    self._probes_sent += 1
             await asyncio.sleep(PROBE_INTERVAL)

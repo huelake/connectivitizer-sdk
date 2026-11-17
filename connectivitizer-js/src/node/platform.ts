@@ -8,6 +8,7 @@ import { isIpv6, normalizeHost } from '../core/direct/addresses.js';
 import { ConnectivitizerError, ErrorCodes } from '../core/errors.js';
 import type { Platform, UdpSocket, WebSocketConnection } from '../core/platform.js';
 import { type ByteStream, ChunkQueue } from '../core/streams.js';
+import { isGlobalIpv6 } from '../core/direct/addresses.js';
 import { StreamWebSocket, WebSocketRefusedError } from '../core/websocket.js';
 
 export interface NodePlatformOptions {
@@ -191,7 +192,10 @@ export function nodePlatform(options: NodePlatformOptions = {}): Platform {
     udp: {
       bind: bindUdp,
       localAddresses: async () => {
-        const addresses: string[] = [];
+        // First the IPv6 address this machine sends from: the core announces only a few, and that one has to
+        // be among them (docs/protocol, 6.3).
+        const outgoing = await outgoingIpv6();
+        const addresses: string[] = outgoing ? [outgoing] : [];
         for (const list of Object.values(os.networkInterfaces())) {
           for (const entry of list ?? []) {
             // IPv6: only global addresses are offered (the core filters); they need no zone.
@@ -217,4 +221,38 @@ export function nodePlatform(options: NodePlatformOptions = {}): Platform {
         });
       }),
   };
+}
+
+/**
+ * The address this machine sends from to the IPv6 internet, as its routing and address selection decide
+ * (RFC 6724; usually a temporary address). A UDP socket is given a destination and asked for its own
+ * address: nothing is sent. Undefined without IPv6 or without a route.
+ */
+export function outgoingIpv6(): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    let socket: dgram.Socket;
+    const done = (address?: string) => {
+      try {
+        socket.close();
+      } catch {
+        // already closed
+      }
+      const host = address ? normalizeHost(address) : null;
+      resolve(host && isGlobalIpv6(host) ? host : undefined);
+    };
+    try {
+      socket = dgram.createSocket('udp6');
+      socket.once('error', () => done());
+      // Any global address has the same route; this one is reserved for documentation (RFC 3849).
+      socket.connect(9, '2001:db8::1', () => {
+        try {
+          done(socket.address().address);
+        } catch {
+          done();
+        }
+      });
+    } catch {
+      resolve(undefined);
+    }
+  });
 }

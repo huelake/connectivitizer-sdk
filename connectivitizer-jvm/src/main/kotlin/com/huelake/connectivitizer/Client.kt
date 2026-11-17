@@ -47,6 +47,22 @@ internal class SdkRuntime(name: String) {
 }
 
 /**
+ * What a device hands the calling half it owns: its thread, its connection to the platform, its clock and its log.
+ * The calling half then logs in nowhere and closes neither the connection nor the thread.
+ */
+internal class DeviceAttachment(
+    val runtime: SdkRuntime,
+    /** The device's signaling connection, once the device is connected. Throws when the device stops. */
+    val signaling: suspend () -> Signaling,
+    /** The connection the device has at this moment, if any. */
+    val current: () -> Signaling?,
+    val nowSeconds: () -> Long,
+    /** Called when the opening of a session is over, whether it succeeded or not. */
+    val opened: (String) -> Unit,
+    val log: (String) -> Unit,
+)
+
+/**
  * The calling side: an application that connects to services on devices.
  *
  * ```kotlin
@@ -60,7 +76,8 @@ internal class SdkRuntime(name: String) {
  * From Java the same with [connectBlocking] (or [connectAsync]) and [TunnelSession.fetchBlocking].
  */
 class ConnectivitizerClient private constructor(private val options: Builder) : AutoCloseable {
-    private val runtime = SdkRuntime("connectivitizer-client")
+    private val attachment = options.attachment
+    private val runtime = attachment?.runtime ?: SdkRuntime("connectivitizer-client")
     private val scope = runtime.scope
     private val platform = options.platform ?: Platform()
     private val api = PlatformApi(options.apiUrl, platform, scope)
@@ -69,13 +86,17 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
     private val answers = HashMap<String, CompletableDeferred<Pair<Boolean, String?>>>()
     private val candidates = HashMap<String, CompletableDeferred<ByteArray>>()
     private val sessions = HashMap<String, TunnelSession>()
+    /** The sessions this client asked for, from the moment the platform granted them until they have ended. */
+    private val own = HashSet<String>()
+    /** The connect requests the platform has not answered yet. */
+    private var requesting = 0
     private var signaling: Signaling? = null
     private val connecting = Mutex()
     private var clockOffset = 0L
     private var closed = false
 
     init {
-        if ((options.apiKey == null) == (options.tokenProvider == null)) throw ConnectivitizerException(ErrorCodes.INVALID_REQUEST, "An application authenticates with an API key or with a token provider.")
+        if (attachment == null && (options.apiKey == null) == (options.tokenProvider == null)) throw ConnectivitizerException(ErrorCodes.INVALID_REQUEST, "An application authenticates with an API key or with a token provider.")
         if (keys.isEmpty()) throw ConnectivitizerException(ErrorCodes.INVALID_REQUEST, "An application needs a shared key: without one there is nothing to encrypt end to end with.")
     }
 
@@ -91,6 +112,7 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
         internal var disableDirect = false
         internal var stunServers: List<String>? = null
         internal var platform: Platform? = null
+        internal var attachment: DeviceAttachment? = null
 
         /** The application's API key (`czk_…`), created in the web app or handed over by [Link.linkApp]. */
         fun apiKey(value: String) = apply { apiKey = value }
@@ -122,7 +144,24 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
         fun builder(apiUrl: String) = Builder(apiUrl)
     }
 
-    private fun nowSeconds() = System.currentTimeMillis() / 1000 + clockOffset
+    private fun nowSeconds() = attachment?.nowSeconds?.invoke() ?: (System.currentTimeMillis() / 1000 + clockOffset)
+
+    /** True for a session this client asked for, from the moment the platform granted it until it has ended. */
+    internal fun owns(sessionId: String) = sessionId in own
+
+    /** The sessions this client opened that are still running. */
+    internal val openSessions: List<ConnectionInfo> get() = sessions.values.map { it.info }
+
+    /** Ends every session this client opened. Runs on the SDK's thread. */
+    internal suspend fun endAll(reason: String) {
+        for (session in sessions.values.toList()) runCatching { session.end(reason) }
+    }
+
+    /** Closes every session this client opened and refuses further ones. Runs on the SDK's thread. */
+    internal suspend fun closeSessions() {
+        closed = true
+        for (session in sessions.values.toList()) runCatching { session.close() }
+    }
 
     /**
      * Opens a session to [device] (its name or id) for the named services. Throws [ConnectivitizerException];
@@ -143,27 +182,37 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
     suspend fun shutdown() {
         withContext(runtime.dispatcher) {
             if (closed) return@withContext
-            closed = true
-            for (session in sessions.values.toList()) runCatching { session.close() }
+            closeSessions()
             // Give the end-of-session reports a moment to leave before the channel closes.
             delay(50)
             signaling?.close()
         }
-        runtime.shutdown()
+        // The thread and the connection of a device stay the device's.
+        if (attachment == null) runtime.shutdown()
     }
 
     override fun close() = runBlocking { shutdown() }
 
-    private suspend fun connectOnSdk(device: String, services: List<String>): TunnelSession {
+    /** Opens a session on the SDK's thread. A device calls it on its own thread, which this client then shares. */
+    internal suspend fun connectOnSdk(device: String, services: List<String>): TunnelSession {
         if (closed) throw ConnectivitizerException(ErrorCodes.SESSION_CLOSED, "The client is closed.")
         val sharedKey = selectSharedKey(device) ?: throw ConnectivitizerException(ErrorCodes.E2E_NO_COMMON_METHOD, "No shared key is configured for '$device' (name one after the device, or 'default').")
         val signaling = ensureSignaling()
-        val reply = signaling.request("connect.request", mapOf("device" to device, "services" to services, "e2e" to listOf(E2eMethods.SHARED_KEY)), ANSWER_TIMEOUT)
-        val granted = reply.map("d") ?: emptyMap()
-        val sessionId = granted.string("sid")
-        val grantToken = granted.string("grant")
-        val peer = granted.map("peer")
-        if (reply["t"] != "connect.grant" || sessionId == null || grantToken == null || peer == null) throw ConnectivitizerException(ErrorCodes.INVALID_REQUEST, "The control plane sent an unexpected answer.")
+        requesting++
+        val (sessionId, grantToken, peer) = try {
+            val reply = signaling.request("connect.request", mapOf("device" to device, "services" to services, "e2e" to listOf(E2eMethods.SHARED_KEY)), ANSWER_TIMEOUT)
+            val granted = reply.map("d") ?: emptyMap()
+            val sid = granted.string("sid")
+            val token = granted.string("grant")
+            val described = granted.map("peer")
+            if (reply["t"] != "connect.grant" || sid == null || token == null || described == null) throw ConnectivitizerException(ErrorCodes.INVALID_REQUEST, "The control plane sent an unexpected answer.")
+            own.add(sid)
+            Triple(sid, token, described)
+        } finally {
+            // On a device's connection, candidates of sessions opened to it pass by as well. Those kept while the
+            // session id of this request was unknown are dropped.
+            if (--requesting == 0 && attachment != null) candidates.keys.filter { it !in own }.forEach { candidates.remove(it) }
+        }
 
         var attempt: DirectAttempt? = null
         try {
@@ -200,7 +249,8 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
             var session: TunnelSession? = null
             if (directPermitted) {
                 val stun = options.stunServers ?: signaling.welcome.strings("stunServers") ?: emptyList()
-                val current = DirectAttempt(platform, Roles.INITIATOR, sessionId, grantToken, stun, peerReflexiveFor(grant.e2eMethod), scope)
+                val directLog = attachment?.let { device -> { line: String -> device.log("session $sessionId: direct: $line") } }
+                val current = DirectAttempt(platform, Roles.INITIATOR, sessionId, grantToken, stun, peerReflexiveFor(grant.e2eMethod), scope, directLog)
                 attempt = current
                 scope.launch { runCatching { current.setRemoteCandidates(waiter(candidates, sessionId).await()) } }
                 val blob = current.gather()
@@ -223,17 +273,20 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
             }
             sessions[sessionId] = session
             val info = session.info
+            attachment?.log?.invoke("session $sessionId opened to $peerLabel (${info.mode}, ${info.trust}${info.peerAddress?.let { ", peer at $it" } ?: ""})")
             report(mapOf("sid" to sessionId, "state" to "established", "mode" to info.mode, "trust" to info.trust, "directFailureReason" to info.directFailureReason, "transport" to info.transport))
             val established = session
             scope.launch { watch(established) }
             scope.launch { renewLeases(established) }
             return session
         } catch (e: Throwable) {
+            own.remove(sessionId)
             report(mapOf("sid" to sessionId, "state" to "failed", "error" to codeOf(e)))
             throw e
         } finally {
             candidates.remove(sessionId)?.cancel()
             attempt?.close()
+            attachment?.opened?.invoke(sessionId)
         }
     }
 
@@ -244,8 +297,9 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
 
     private suspend fun token(): TokenResponse = options.apiKey?.let { api.credentialToken(it) } ?: options.tokenProvider!!.token()
 
-    private suspend fun ensureSignaling(): Signaling = connecting.withLock {
-        signaling?.takeIf { it.isOpen } ?: openSignaling()
+    private suspend fun ensureSignaling(): Signaling {
+        if (attachment != null) return attachment.signaling()
+        return connecting.withLock { signaling?.takeIf { it.isOpen } ?: openSignaling() }
     }
 
     private suspend fun openSignaling(): Signaling {
@@ -260,12 +314,14 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
         return opened
     }
 
-    private fun onSignal(message: Map<String, Any?>) {
+    /** Takes a message from the signaling connection. A device passes on what concerns the sessions it opened. */
+    internal fun onSignal(message: Map<String, Any?>) {
         val data = message.map("d") ?: emptyMap()
         val sessionId = data.string("sid")
         when (message["t"]) {
             "connect.answer" -> if (sessionId != null) waiter(answers, sessionId).complete((data["accept"] == true) to data.string("error"))
-            "path.candidates" -> if (sessionId != null) data.string("blob")?.let { blob -> runCatching { Bytes.base64Decode(blob) }.getOrNull()?.let { waiter(candidates, sessionId).complete(it) } }
+            // On a device's connection, only the candidates of a session this client opened, or of one it is asking for, are kept.
+            "path.candidates" -> if (sessionId != null && (attachment == null || sessionId in own || requesting > 0)) data.string("blob")?.let { blob -> runCatching { Bytes.base64Decode(blob) }.getOrNull()?.let { waiter(candidates, sessionId).complete(it) } }
             "revoke" -> {
                 val sids = data["sids"].asList()
                 val reason = data.string("reason") ?: ErrorCodes.SESSION_REVOKED
@@ -278,6 +334,8 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
     private suspend fun watch(session: TunnelSession) {
         val reason = session.completion.await()
         sessions.remove(session.info.sessionId)
+        own.remove(session.info.sessionId)
+        attachment?.log?.invoke("session ${session.info.sessionId} ended ($reason)")
         report(mapOf("sid" to session.info.sessionId, "state" to "ended", "error" to reason, "bytesSent" to session.bytesSent, "bytesReceived" to session.bytesReceived))
     }
 
@@ -309,7 +367,7 @@ class ConnectivitizerClient private constructor(private val options: Builder) : 
 
     private fun report(update: Map<String, Any?>) {
         // Reporting is best effort; the session itself is unaffected.
-        runCatching { signaling?.takeIf { it.isOpen }?.send("session.update", update) }
+        runCatching { (if (attachment != null) attachment.current() else signaling)?.takeIf { it.isOpen }?.send("session.update", update) }
     }
 }
 

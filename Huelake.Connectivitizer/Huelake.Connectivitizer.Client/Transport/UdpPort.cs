@@ -88,8 +88,15 @@ internal sealed class UdpPort : IAsyncDisposable
 
     public long DatagramsReceived => Interlocked.Read(ref _datagramsReceived);
 
+    /// <summary>Datagrams the system refused to send (no route, no address of that family, ...).</summary>
+    public long SendFailures => Interlocked.Read(ref _sendFailures);
+
+    /// <summary>The first destination a send failed for and why; null when every send went out.</summary>
+    public string? FirstSendFailure { get; private set; }
+
     private long _datagramsSent;
     private long _datagramsReceived;
+    private long _sendFailures;
 
     public void Start()
     {
@@ -137,6 +144,10 @@ internal sealed class UdpPort : IAsyncDisposable
             or SocketError.AddressNotAvailable or SocketError.AddressFamilyNotSupported)
         {
             // UDP is best effort; an unreachable candidate is an expected outcome, not an error.
+            if (Interlocked.Increment(ref _sendFailures) == 1)
+            {
+                FirstSendFailure = $"{Plain(remote)}: {ex.SocketErrorCode}";
+            }
         }
     }
 

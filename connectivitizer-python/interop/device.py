@@ -5,8 +5,10 @@ exposes one local service and serves until it is told to stop (a line on stdin, 
   CZ_TARGET             host:port of the local application to expose as CZ_SERVICE (default api)
   CZ_DIRECT=none        never attempt a peer-to-peer connection
   CZ_LOOPBACK=true      offer loopback addresses (both endpoints on one machine)
+  CZ_CALL=<device>/<service>   once connected, open a session to that device and GET /hello on that service
 
-It prints READY once the platform sees it, and its log after that.
+It prints READY once the platform sees it, and its log after that. With CZ_CALL it also prints one line
+"CALLED <mode> <body>", or "CALL_FAILED <code>", and keeps that session open until it stops.
 """
 
 from __future__ import annotations
@@ -62,6 +64,16 @@ async def main() -> int:
     async def announce() -> None:
         await agent.wait_until_connected()
         say("READY")
+        call = os.environ.get("CZ_CALL")
+        if not call:
+            return
+        try:
+            device, _, service = call.partition("/")
+            session = await agent.connect(device, [service])
+            hello = await session.fetch(service, "/hello")
+            say(f"CALLED {session.info.mode} {await hello.text()}")
+        except Exception as error:
+            say(f"CALL_FAILED {error.code if isinstance(error, ConnectivitizerError) else type(error).__name__}")
 
     asyncio.ensure_future(announce())
     try:
